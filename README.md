@@ -1,6 +1,8 @@
 # Codex1CC
 
-Codex1CC is a local MCP bridge that lets Codex submit one complete task to Claude Code CLI, then review its result during a later conversation. The executor stores tasks and events independently of the MCP connection. It does not poll Codex or wake a closed conversation.
+Codex1CC lets you ask Codex to hand a well-defined task to Claude Code, then review the result with Codex later. You describe the task in plain language. Claude Code reads only the project files you authorize and returns its findings. The task record stays on the computer running the tool, so you can close Codex and check the result in a new conversation.
+
+Install Codex1CC where it can access your project files and Claude Code. Codex connects to it through MCP, a tool interface; you do not need to run a web service. Codex1CC does not notify you when a task finishes or wake a closed conversation.
 
 **Status: alpha.** Linux has a read-only bubblewrap runner. A non-sensitive real task, blocking question, session resume, and Codex review passed locally. macOS isolation and broader platform acceptance are still release gates. Editing user projects is disabled. Do not use this as a security boundary for sensitive projects until those gates pass.
 
@@ -46,7 +48,7 @@ Run diagnostics:
 
     codex1cc doctor
 
-The doctor command starts the local executor if it is not running. It checks whether bubblewrap can launch; it does not prove that your model credentials or endpoint work.
+The doctor command starts the background process if needed. It checks whether bubblewrap can launch; it does not prove that your model credentials or endpoint work.
 
 Register the MCP server explicitly in Codex after reviewing the command:
 
@@ -81,7 +83,7 @@ Without `statuses`, `list_tasks` returns only tasks waiting for an answer or rev
 
 Tell Codex the objective, task context, acceptance checks, deliverables, exact authorized paths, question policy, and limits. Codex supplies a unique `request_id` for each tool operation and reuses the same ID when retrying that operation. This release accepts only `actions=["read"]`. The project-level `rounds` cap is fixed by configuration; task-specific time and USD caps may be lower.
 
-This prompt matches the **local L21 configuration**. Replace the project ID, paths, and objective on other machines:
+This prompt works on a computer where **L21 is already authorized with these paths**. Replace the project ID, paths, and objective for other projects:
 
 > Use Codex1CC `submit_task` to send CC **one read-only task** with `project_id="L21"`. Objective: compare the Production Shell Migration plan with the current project documents and identify unresolved blockers, ordered by impact on the next decision. Context: follow `CLAUDE.md` and the baseline documents when deciding which source is authoritative; do not present old status notes as current facts. Set `scope=["README.md","CLAUDE.md","docs","openspec","project_chain/docs/baseline"]`. Acceptance: give a file path and evidence for each blocker; separate verified facts from items requiring verification; do not claim to have run tests or seen files outside the snapshot. Deliverables: a short conclusion, blocker list, and suggested first independent follow-up task. Ask me one concrete question only if blocked. Use `actions=["read"]`, at most 1800 seconds and 0.25 USD (rounds follow the project cap). Submit once, report the task ID and accepted scope, then end this turn. Do not wait or poll for the result.
 

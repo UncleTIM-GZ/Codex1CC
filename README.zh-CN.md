@@ -2,16 +2,18 @@
 
 [English README](README.md) · [产品需求文档](Codex1CC%20产品需求文档.md) · [验证记录](docs/validation.md)
 
-Codex1CC 是本机 MCP 桥接工具：Codex 提交并验收一项完整任务，Claude Code（CC）在后台读取授权文件快照并返回结论。任务保存在本机执行器中；关闭 Codex 对话后，可以在新对话里接续。工具不会按时间轮询 Codex、主动通知你或唤醒已关闭的对话。
+Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 CC），稍后再让 Codex 检查结果。你用自然语言下指令；CC 只读取你授权的项目文件并给出结论。即使关闭 Codex 对话，任务记录仍保存在运行工具的电脑上，重新打开 Codex 后可以继续查看。
 
-**当前是 alpha 只读版。** Linux + bubblewrap 已通过本机真实任务测试；WSL 走 Linux 路径。macOS 的真实任务隔离尚未实现，原生 Windows 未支持。CC 不能修改项目、运行项目命令或执行发布。完整 v1 发布门槛见 [验证记录](docs/validation.md)。
+这个工具需要安装在能够访问项目文件和 Claude Code 的电脑上。安装后，Codex 通过 MCP（连接外部工具的接口）调用它；你无需自行运行网页服务。工具不会主动提醒你任务已完成，也不会唤醒已关闭的对话。
+
+**当前是 alpha 只读版。** Linux + bubblewrap 已通过开发环境的真实任务测试；WSL 走 Linux 路径。macOS 的真实任务隔离尚未实现，原生 Windows 未支持。CC 不能修改项目、运行项目命令或执行发布。完整 v1 发布门槛见 [验证记录](docs/validation.md)。
 
 ## 1. 安装前准备
 
 - Python 3.10+；推荐使用较新的 `uv` 或 `pipx` 安装隔离的 Python 工具环境。
-- 支持本机 stdio MCP 的 Codex 客户端，以及已能登录并调用模型的 Claude Code CLI。
+- 支持 stdio MCP 的 Codex 客户端，以及已能登录并调用模型的 Claude Code CLI。
 - Linux/WSL 上安装 `bubblewrap`（命令名 `bwrap`），并允许非特权用户命名空间。
-- 目标项目已在本机，且你知道希望允许 CC 读取哪些文件。模型调用会产生服务商费用。
+- 目标项目的文件位于运行工具的电脑上，且你知道希望允许 CC 读取哪些文件。模型调用会产生服务商费用。
 
 ## 2. 安装和注册（每台机器一次）
 
@@ -32,7 +34,7 @@ codex mcp add codex1cc -- /absolute/path/to/codex1cc mcp
 codex mcp list
 ```
 
-应看到 `codex1cc` 已启用。若 Codex 会话在注册之前已打开，重启或刷新客户端。`doctor` 会按需启动本机执行器，只检查基础运行条件；它不验证模型账号、服务端模型 ID 或目标项目的任务结果。Codex CLI 的项目目录和 MCP 配置方式见 [官方 OpenAI 文档：CLI](https://learn.chatgpt.com/docs/codex/cli)及 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+应看到 `codex1cc` 已启用。若 Codex 会话在注册之前已打开，重启或刷新客户端。`doctor` 会按需启动后台程序，只检查基础运行条件；它不验证模型账号、服务端模型 ID 或目标项目的任务结果。Codex CLI 的项目目录和 MCP 配置方式见 [官方 OpenAI 文档：CLI](https://learn.chatgpt.com/docs/codex/cli)及 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
 
 ## 3. 初始化一个授权项目（每个项目一次）
 
@@ -67,7 +69,7 @@ codex mcp list
 - Return concise conclusions with evidence paths; record reusable public facts here.
 ```
 
-本机已配置的 L21 使用 `project_id="L21"`。这是本机配置示例，克隆本仓库到别的机器**不会自动授权 L21**。首次配置后，可用 `codex1cc doctor` 检查运行条件；首次真实任务还需检查模型认证是否有效。
+下面的 L21 示例使用 `project_id="L21"`，只适用于已将 L21 加入项目配置的电脑。克隆 Codex1CC 仓库**不会自动授权 L21**。首次配置后，可用 `codex1cc doctor` 检查运行条件；首次真实任务还需检查模型认证是否有效。
 
 ## 4. 每次进入项目怎么开始
 
@@ -78,7 +80,7 @@ cd /absolute/path/to/demo
 codex
 ```
 
-如果使用本机 L21，新会话可以直接说：
+如果已授权 L21，新会话可以直接说：
 
 > 我现在管理 `L21`。请先确认当前分支和工作区状态，再用 Codex1CC 的 `list_tasks(project_id="L21", statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])` 查看未完成任务。只对需要回答、验收或排查的任务调用 `get_task`。汇报结论和下一步；不要定时轮询，也不要自动重交旧任务。
 
@@ -88,7 +90,7 @@ codex
 
 用自然语言交代**目标、上下文、验收标准、交付物、授权路径、提问规则、时间与费用上限**。Codex 负责把它们填入 `submit_task`，并为每次操作生成唯一 `request_id`；操作重试应沿用原 ID。只读版的 `actions` 必须为 `["read"]`。
 
-以下指令可在已配置的本机 L21 项目直接使用：
+以下指令可在已授权 L21 的电脑上直接使用：
 
 > 请用 Codex1CC 的 `submit_task` 给 CC 派发**一项只读任务**，`project_id="L21"`。目标：核对 Production Shell Migration 的文档计划，找出未关闭的阻塞项，并按对下一步决策的影响排序。上下文：先按 `CLAUDE.md` 与 baseline 文档判断资料权威性；只依据本次快照可见的文件，不把旧状态写成现状。`scope=["README.md","CLAUDE.md","docs","openspec","project_chain/docs/baseline"]`。验收标准：每个阻塞项有文件路径和依据；明确区分已确认事实与待验证项；不得声称运行过测试或看过快照外的代码。交付物：简短结论、阻塞项清单、建议的首个独立任务。只在无法继续时用提问工具问我一个具体问题。`actions=["read"]`，时间最多 1800 秒、费用最多 0.25 USD（轮数按项目配置）。只提交一次，告诉我任务 ID 和已接受的范围，然后结束本轮；不要等待或轮询结果。
 
@@ -126,7 +128,7 @@ codex
 
 Linux 使用 bubblewrap 隔离 CC 的只读快照；缺少隔离环境时任务会失败。CC 的可用工具限于读取、搜索和内部提问，不能运行项目命令、浏览网页或编辑文件。此 alpha 尚未完成跨机器和 macOS 验证，**不要把它作为敏感项目的充分安全边界**。
 
-任务秒数、轮数与费用有项目上限。Claude CLI 报告的 USD 费用用于限额判断，可能与服务商最终账单不同；缺失费用报告时不允许继续下一轮。CC 使用你自己的 Claude Code 认证与模型服务。任务数据、事件和快照保存在本机状态目录，可通过 `codex1cc doctor` 查看路径。
+任务秒数、轮数与费用有项目上限。Claude CLI 报告的 USD 费用用于限额判断，可能与服务商最终账单不同；缺失费用报告时不允许继续下一轮。CC 使用你自己的 Claude Code 认证与模型服务。任务数据、事件和快照保存在运行工具的电脑上，可通过 `codex1cc doctor` 查看路径。
 
 ## 9. 常见问题
 
@@ -149,7 +151,7 @@ codex mcp remove codex1cc
 uv tool uninstall codex1cc     # 若用 pipx 安装，则用 pipx uninstall codex1cc
 ```
 
-卸载工具不会自动删除项目共享文件、项目配置或本机任务历史。删除这些文件是独立且不可逆的操作。
+卸载工具不会自动删除项目共享文件、项目配置或已保存的任务历史。删除这些文件是独立且不可逆的操作。
 
 从源码开发或验证：
 
