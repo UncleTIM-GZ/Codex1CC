@@ -30,10 +30,10 @@ Edit the displayed JSON config. Keep it readable only by your user (mode 0600). 
 
     {
       "projects": {
-        "example": {
-          "root": "/absolute/path/to/example",
+        "demo": {
+          "root": "/absolute/path/to/demo",
           "shared_context": "CODEX1CC_CONTEXT.md",
-          "read_paths": ["README.md", "src"],
+          "read_paths": ["README.md", "docs", "src"],
           "model": "your-working-model-id",
           "limits": {"seconds": 1800, "usd": 0.25, "rounds": 3}
         }
@@ -71,11 +71,11 @@ cd /absolute/path/to/your-project
 codex
 ```
 
-Tell Codex which authorized project you want to manage, such as L21. Opening a directory alone does not select a Codex1CC project. If the MCP tools are missing, run `codex mcp list` and restart or refresh your Codex client. On another machine, authorize the project first; this repository does not ship your project configuration.
+Tell Codex which authorized project you want to manage, such as `demo` in the example above. Opening a directory alone does not select a Codex1CC project. If the MCP tools are missing, run `codex mcp list` and restart or refresh your Codex client. On another machine, authorize the project first; this repository does not ship your project configuration.
 
-For a newly opened L21 session on the machine where L21 is configured, paste this prompt:
+For a newly opened session in a project configured as `demo`, you can say:
 
-> Continue with L21. Check the current branch and uncommitted changes, then see how the tasks I gave CC are progressing. Tell me if CC needs an answer or has a result ready for review. Do not submit the same task again or keep waiting for it to finish.
+> Continue with the demo project. Check the current branch and uncommitted changes, then see how the tasks I gave CC are progressing. Tell me if CC needs an answer or has a result ready for review. Do not submit the same task again or keep waiting for it to finish.
 
 Codex checks task status for you; you do not need to remember tool names or status codes. The background process starts on demand, so there is nothing to launch for each session.
 
@@ -83,9 +83,9 @@ Codex checks task status for you; you do not need to remember tool names or stat
 
 In plain language, tell Codex what you want to learn, which sources matter, what would count as a satisfactory answer, and what you want back. Mention any time or cost limit you have. Codex checks the authorized paths and fills in the tool arguments; you do not need to write JSON or memorize function names.
 
-This prompt works on a computer where **L21 is already authorized with these paths**. Replace the project ID, paths, and objective for other projects:
+This prompt uses the `demo` configuration above. Replace the project name, sources, and objective for your project:
 
-> Ask CC to review L21's Production Shell Migration plan. Read the README, project rules, `docs`, `openspec`, and baseline documents. Identify unresolved blockers and rank them by impact on the next decision. Give a source path for each item and separate confirmed facts from questions. This is analysis only: do not edit files or claim to have run tests. Return a short conclusion and the first suggested follow-up task. Once delegated, give me the task number; we can review the result when I return.
+> Ask CC to compare the demo project's README and `docs` with the relevant `src` files. Identify claims that the code does not support or that still need verification. Give a file path for each finding and separate confirmed facts from questions. This is analysis only: do not edit files or claim to have run tests. Return a short conclusion and the first suggested follow-up task. Once delegated, give me the task number; we can review the result when I return.
 
 Codex translates the request into a bounded task. CC can read only the selected snapshot and cannot execute project commands. A snapshot over 20 MiB or 2000 files is rejected; narrow the requested sources or authorize more specific paths. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Only one Codex1CC task can be active per project at a time.
 
@@ -105,7 +105,7 @@ You may close the Codex conversation. Reopen Codex in the project or resume the 
 
 Review prompt:
 
-> Help me review CC's result for L21. Check it against the original request and its evidence. If evidence is missing, tell me what is missing and ask CC to investigate further if possible. Record it as complete only when it meets the request, then give me the final conclusion. Do not treat CC's claim that a test passed as a verified test run.
+> Help me review CC's result for the demo project. Check it against the original request and its evidence. If evidence is missing, tell me what is missing and ask CC to investigate further if possible. Record it as complete only when it meets the request, then give me the final conclusion. Do not treat CC's claim that a test passed as a verified test run.
 
 If you no longer need a task, tell Codex to cancel it and give its task number. Recording acceptance does not edit or deploy the project. Follow-up investigation uses the original file snapshot; submit a new task to capture changed project files.
 

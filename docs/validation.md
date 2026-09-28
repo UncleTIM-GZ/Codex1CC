@@ -6,7 +6,7 @@ Date: 2026-09-29 (Asia/Shanghai)
 
 - Linux under WSL, Python 3.10, Claude Code CLI 2.1.283, MCP Python package 1.26.0, bubblewrap 0.6.1.
 - Temporary, non-sensitive project containing a README with the verification word ORCHID and one shared context file. No business repository was used.
-- Project-level model override to deepseek-flash. User-wide Claude settings were not modified.
+- Project-level override to a working Anthropic-compatible model. User-wide Claude settings were not modified.
 
 ## Results
 
@@ -22,7 +22,7 @@ Date: 2026-09-29 (Asia/Shanghai)
 | Explicit session resume | Passed: second round used the saved session ID and returned ORCHID |
 | Codex review completion | Passed: complete_task moved each reviewed task to completed |
 
-The question and resumed task reported 0.092003 USD cumulative cost in the CLI result. This is an observed CLI value, not a verified provider invoice. Each invocation had a cap and the cumulative task limit was 0.15 USD.
+The CLI reported a nonzero cumulative cost within the configured task limit. This is an observed CLI value, not a verified provider invoice. Each invocation also had its own cap.
 
 ## Release gates still open
 
