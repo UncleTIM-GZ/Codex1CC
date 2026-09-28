@@ -71,49 +71,49 @@ cd /absolute/path/to/your-project
 codex
 ```
 
-The working directory does **not** select a Codex1CC project automatically. State the configured `project_id` in your request. If the MCP tools are missing, run `codex mcp list` and restart or refresh your Codex client. On another machine, create the project authorization first; this repository does not ship your local project configuration.
+Tell Codex which authorized project you want to manage, such as L21. Opening a directory alone does not select a Codex1CC project. If the MCP tools are missing, run `codex mcp list` and restart or refresh your Codex client. On another machine, authorize the project first; this repository does not ship your project configuration.
 
 For a newly opened L21 session on the machine where L21 is configured, paste this prompt:
 
-> I am managing `L21`. First check the current branch and working tree. Then call Codex1CC `list_tasks(project_id="L21", statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])` once. Use `get_task` only for a question, review, or failure that needs action. Summarize the status and next step. Do not poll on a timer or resubmit an old task automatically.
+> Continue with L21. Check the current branch and uncommitted changes, then see how the tasks I gave CC are progressing. Tell me if CC needs an answer or has a result ready for review. Do not submit the same task again or keep waiting for it to finish.
 
-Without `statuses`, `list_tasks` returns only tasks waiting for an answer or review, plus failed or interrupted tasks. Include running statuses explicitly when you want a complete unfinished-task view. The executor starts on demand; you do not have to launch it for each session.
+Codex checks task status for you; you do not need to remember tool names or status codes. The background process starts on demand, so there is nothing to launch for each session.
 
 ### Submit one bounded task
 
-Tell Codex the objective, task context, acceptance checks, deliverables, exact authorized paths, question policy, and limits. Codex supplies a unique `request_id` for each tool operation and reuses the same ID when retrying that operation. This release accepts only `actions=["read"]`. The project-level `rounds` cap is fixed by configuration; task-specific time and USD caps may be lower.
+In plain language, tell Codex what you want to learn, which sources matter, what would count as a satisfactory answer, and what you want back. Mention any time or cost limit you have. Codex checks the authorized paths and fills in the tool arguments; you do not need to write JSON or memorize function names.
 
 This prompt works on a computer where **L21 is already authorized with these paths**. Replace the project ID, paths, and objective for other projects:
 
-> Use Codex1CC `submit_task` to send CC **one read-only task** with `project_id="L21"`. Objective: compare the Production Shell Migration plan with the current project documents and identify unresolved blockers, ordered by impact on the next decision. Context: follow `CLAUDE.md` and the baseline documents when deciding which source is authoritative; do not present old status notes as current facts. Set `scope=["README.md","CLAUDE.md","docs","openspec","project_chain/docs/baseline"]`. Acceptance: give a file path and evidence for each blocker; separate verified facts from items requiring verification; do not claim to have run tests or seen files outside the snapshot. Deliverables: a short conclusion, blocker list, and suggested first independent follow-up task. Ask me one concrete question only if blocked. Use `actions=["read"]`, at most 1800 seconds and 0.25 USD (rounds follow the project cap). Submit once, report the task ID and accepted scope, then end this turn. Do not wait or poll for the result.
+> Ask CC to review L21's Production Shell Migration plan. Read the README, project rules, `docs`, `openspec`, and baseline documents. Identify unresolved blockers and rank them by impact on the next decision. Give a source path for each item and separate confirmed facts from questions. This is analysis only: do not edit files or claim to have run tests. Return a short conclusion and the first suggested follow-up task. Once delegated, give me the task number; we can review the result when I return.
 
-Codex translates the prompt into `submit_task` arguments; you do not need to write JSON. CC can read only the snapshot and cannot execute project commands. Pick only the paths needed for this task. A snapshot over 20 MiB or 2000 files is rejected; narrow the task scope or add more specific authorized entries. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Only one Codex1CC task can be active per project at a time.
+Codex translates the request into a bounded task. CC can read only the selected snapshot and cannot execute project commands. A snapshot over 20 MiB or 2000 files is rejected; narrow the requested sources or authorize more specific paths. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Only one Codex1CC task can be active per project at a time.
 
 ### Return later, answer, review, or cancel
 
 You may close the Codex conversation. Reopen Codex in the project or resume the old conversation, then use the session-start prompt above. The executor stores task IDs, status, original objective, acceptance checks, scope, and results independently of the chat. If you know a task ID, ask:
 
-> Call Codex1CC `get_task(task_id="YOUR_TASK_ID")`. Show the original acceptance checks, current status, result, and any pending question. Do not submit a replacement task.
+> Check CC's earlier task, number "YOUR_TASK_ID". Tell me its progress, any question I need to answer, and its result. Do not submit it again.
 
-| Status | Action |
+| What you see | What to do |
 |---|---|
-| `queued` / `running` / `continuing` | Save the task ID. Check again during a later natural interaction; do not poll on a timer. |
-| `waiting_answer` | Read the question with `get_task`. After you answer, have Codex call `respond_task` within the original authorization. |
-| `review_required` | Compare the result with the original acceptance checks. If it passes, call `complete_task` with a review note. If more investigation is needed and the original snapshot, budget, and rounds suffice, give `continue_task` a specific instruction. |
-| `failed` / `interrupted` | Inspect the error and events. Fix the cause, then explicitly submit a new task. Interrupted work is never replayed automatically. |
-| `completed` / `canceled` | Terminal states. History remains queryable until its retained content is pruned. |
+| CC is waiting or working | Save the task number and ask Codex again later; do not keep checking. |
+| CC has a question | Ask Codex to explain it, then give your answer for Codex to forward. |
+| CC has returned a result | Ask Codex to review it against the original request; request more evidence if needed. |
+| The task failed or stopped | Find out why, fix the cause, then explicitly ask for a new task. It is not retried automatically. |
+| The task is complete or canceled | No action needed; its record remains queryable during the retention period. |
 
 Review prompt:
 
-> Find L21 tasks awaiting review. Use `get_task` to compare each result with its saved acceptance checks and evidence. If evidence is missing, use `continue_task` only when the old snapshot and remaining budget suffice. Call `complete_task` only after review, then give me the final conclusion. Do not treat CC's statement that a test passed as a verified test run.
+> Help me review CC's result for L21. Check it against the original request and its evidence. If evidence is missing, tell me what is missing and ask CC to investigate further if possible. Record it as complete only when it meets the request, then give me the final conclusion. Do not treat CC's claim that a test passed as a verified test run.
 
-If an active task is no longer useful, ask Codex to call `cancel_task` for its ID. `complete_task` records acceptance; it does not edit or deploy the project. `continue_task` uses the original snapshot. Submit a new task to capture changed project files.
+If you no longer need a task, tell Codex to cancel it and give its task number. Recording acceptance does not edit or deploy the project. Follow-up investigation uses the original file snapshot; submit a new task to capture changed project files.
 
 The task content for completed, failed, and canceled tasks is pruned after 30 days when the executor next starts. Pending questions and reviewable tasks are retained. For Codex startup and MCP registration, see the official [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) and [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) documentation.
 
 ### Agent operating contract
 
-1. Use the explicit configured `project_id`; do not infer it from the current directory. On entering a session, call `list_tasks` once as needed and fetch only actionable tasks.
+1. Resolve the user's project name to an explicitly configured `project_id`; do not infer it from the current directory alone. On entering a session, call `list_tasks(project_id=..., statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])` once as needed and fetch only actionable tasks.
 2. Submit each cohesive objective once, with complete context, exact allowed `scope`, acceptance checks, deliverables, question policy, and bounded cost/time. Generate a unique `request_id` per operation; preserve it on retry.
 3. After `submit_task`, return the task ID and accepted status, then end the turn. Do not poll or hold the conversation open for CC.
 4. On a later natural interaction, handle `waiting_answer` with `respond_task`, and `review_required` with evidence review followed by `continue_task` or `complete_task`. Never auto-replay `failed` or `interrupted` work.
