@@ -100,6 +100,8 @@ class ExecutorTest(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(item["data"]["task"]["status"], "review_required", item)
         self.assertIn("Done", item["data"]["task"]["result"]["conclusion"])
+        self.assertEqual(item["data"]["task"]["request"]["acceptance"], ["README inspected"])
+        self.assertEqual(item["data"]["task"]["request"]["scope"], ["README.txt"])
         found = self.call("list_tasks", {})
         self.assertEqual(found["data"]["tasks"][0]["id"], task_id)
         complete = self.call("complete_task", {"task_id": task_id,

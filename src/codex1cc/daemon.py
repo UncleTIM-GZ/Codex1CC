@@ -99,10 +99,15 @@ class Executor:
 
     @staticmethod
     def _public_task(item: dict) -> dict:
-        return {key: item.get(key) for key in (
+        result = {key: item.get(key) for key in (
             "id", "project_id", "status", "round_no", "created_at", "updated_at",
             "session_id", "exit_code", "exit_reason", "usage", "result",
             "snapshot_path", "review_note")}
+        bundle = item.get("bundle")
+        result["request"] = ({key: scrub(bundle.get(key)) for key in (
+            "objective", "context", "acceptance", "deliverables", "scope",
+            "limits", "question_policy")}) if isinstance(bundle, dict) else None
+        return result
 
     async def submit(self, params: dict) -> dict:
         request_id, existing = self._request_id(params, "submit_task")
