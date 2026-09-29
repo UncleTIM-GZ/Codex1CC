@@ -8,32 +8,38 @@ Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 
 
 **当前是 alpha。** Linux 只读任务与自动接管各通过一次真实任务；写入后端通过模拟测试及一次临时项目的真实编辑、命令验证、本地提交和待验收交付。真实写入任务的 Codex 自动验收与跨机器验收仍待完成。写入模式允许 CC 执行命令，属于显式信任项目模式，不能当作本机文件或网络沙箱。macOS 只读隔离尚未实现；原生 Windows 未支持。完整门槛见 [验证记录](docs/validation.md)。
 
-自动接管按 [PRD v1.5](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试和一次真实 CC → Codex 自动验收已通过。宿主运行中重启恢复、真实问题交接及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
+自动接管按 [PRD v1.6](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试和一次真实 CC → Codex 自动验收已通过。宿主运行中重启恢复、真实问题交接及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
 
 ## 项目逻辑图
 
 ```mermaid
 flowchart TD
-    U[用户] --> C[Codex 对话]
-    S[codex1cc-ops Skill<br/>操作指引] -. 指导 .-> C
-    C --> M[Codex1CC MCP 工具]
-    M --> E[任务执行器]
+    U[用户] --> C[Codex 判断任务依赖并派单]
+    S[codex1cc-ops Skill] -. 操作指引 .-> C
+    C --> M[Codex1CC MCP 工具] --> E[后台执行器]
     CLI[codex1cc 命令行<br/>doctor / bind / watch] --> E
-    CFG[项目授权配置<br/>路径 / 预算 / 绑定] --> E
-    E <--> DB[(任务 / 事件 / 接管记录)]
-    E --> MODE{任务权限}
-    MODE -->|只读| SNAP[授权路径快照]
-    SNAP --> BOX[Linux 隔离运行]
-    MODE -->|显式启用写入| WT[独立 Git worktree]
-    BOX --> CC[Claude Code]
-    WT --> CC
-    CC -->|结果 / 问题 / 失败| E
-    E -->|自动模式事件| H[Codex App Server 接管宿主]
-    H --> D[专用 Codex 会话]
-    D -->|核对 / 回答 / 续接 / 验收 / 回执| M
+    CFG[项目配置<br/>授权路径 / 时间与轮数 / 自动接管<br/>默认最多 3 个并行任务] --> E
+    E <--> DB[(任务 / 会话 / 事件 / 用量)]
+    E --> A{已有活跃任务时<br/>双方 parallel_ok / 路径不重叠 / 未达上限}
+    A -->|通过| T[为每项任务建立独立执行单元]
+    A -->|串行声明、冲突或超限| BUSY[PROJECT_BUSY<br/>待前项验收并核对新 Git 基线]
+    BUSY -. 后续由 Codex 决定再派 .-> C
+    T --> MODE{任务权限}
+    MODE -->|只读| SNAP[授权文件快照] --> BOX[Linux 隔离运行] --> CCR[独立 CC 进程与会话]
+    MODE -->|显式授权写入| WT[独立分支与 Git worktree] --> CCW[独立 CC 进程与会话]
+    CFG -. 提前压缩设置与时间上限 .-> CCR
+    CFG -. 提前压缩设置与时间上限 .-> CCW
+    CCR --> EV[结果 / 提问 / 失败事件]
+    CCW --> EV
+    EV --> DB
+    EV -->|自动接管| H[Codex App Server 接管宿主] --> D[绑定的专用 Codex 会话]
+    D -->|核查 / 回答 / 验收 / 回执| M
+    D -->|已审查的写入阶段| F[continue_task fresh_session] --> E
+    E -->|复用原 worktree，开启新会话| CCW
+    EV -->|上下文超限| X[记录 CONTEXT_LIMIT<br/>保留写入现场，不重试旧会话]
 ```
 
-Codex 通过 MCP 提交一项完整任务；执行器先检查项目授权和预算，再选择只读快照或写入 worktree。CC 的运行结果和事件保存在任务记录中。手动模式由你稍后让 Codex 查询、验收；自动模式在结果、问题或异常出现时唤起已绑定的专用 Codex 会话处理，并保存结论。`codex1cc watch TASK_ID` 等待程序事件，不反复调用模型。写入任务的提交留在独立分支，验收本身不会合并或推送。
+Codex 先判断任务之间是否真能独立完成；执行器再检查声明的路径、`parallel_ok` 和并发上限。默认最多 3 项并行，但任一任务未明确声明可并行时仍按串行准入。每项任务分别保存会话、事件与用量；写入任务还分别持有分支和 worktree。冲突任务返回 `PROJECT_BUSY`，前项验收并进入正确 Git 基线后再派，不会在旧基线上排队。手动模式按需查看，自动模式在提问、交付或失败时唤起已绑定的 Codex 会话；`watch` 等待程序事件，不反复调用模型。经审查的写入阶段可在原 worktree 用新会话接力；上下文超限会保留现场，不自动重试。验收本身不会合并或推送提交。
 
 ## 1. 安装前准备
 
@@ -66,7 +72,7 @@ codex mcp list
 
 ## 3. 初始化一个授权项目（每个项目一次）
 
-用 `codex1cc config-path` 找到 JSON 文件，加入项目 ID、根目录、共享上下文、可读路径和预算。例如：
+用 `codex1cc config-path` 找到 JSON 文件，加入项目 ID、根目录、共享上下文、可读路径和时间、轮数上限。例如：
 
 ```json
 {
@@ -76,7 +82,7 @@ codex mcp list
       "shared_context": "CODEX1CC_CONTEXT.md",
       "read_paths": ["README.md", "docs", "src"],
       "model": "your-working-model-id",
-      "limits": {"seconds": 1800, "usd": 0.25, "rounds": 3}
+      "limits": {"seconds": 1800, "rounds": 3}
     }
   }
 }
@@ -86,13 +92,13 @@ codex mcp list
 - `read_paths` 是**最大授权范围**，不是每次任务都要读的范围。每次 `scope` 只能从列表中选**完全相同的条目**。若授权 `docs`，任务可选 `docs`，不能直接改写成 `docs/one.md`；要单独选择文件，就把该文件另行加入授权列表。
 - 在项目根目录创建共享上下文文件。可放权威资料入口、稳定约束、可复用的公共事实；不要放密钥、个人资料或未经核实的当前状态。CC 每次都会收到该文件的固定版本副本，即使它不在 `scope` 中；写入信任模式下不能把副本权限视为沙箱。
 - 配置文件仅给当前用户读取，例如 `chmod 600 "$(codex1cc config-path)"`。项目文件会发往你给 Claude Code 配置的模型服务；只授权可以发送的路径。目录中若含符号链接或特殊文件，快照会拒绝；`.git` 不会被复制。
-- 项目预算上限由 `limits` 设置。任务可降低秒数和 USD 上限，轮数上限来自项目配置。单次快照最多 **20 MiB / 2000 个文件**；大型资产、构建产物和缓存目录应排除。
+- `limits` 设置时间和轮数上限；任务可降低秒数上限，轮数上限来自项目配置。旧配置的 `limits.usd` 不再生效，新任务若传入该字段会被拒绝。单次快照最多 **20 MiB / 2000 个文件**；大型资产、构建产物和缓存目录应排除。
 
 ### 长程任务与上下文保护
 
 Codex1CC 为自己启动的 CC 任务默认设置更早的自动压缩：将自动压缩窗口设为最多 500000 token，达到该窗口的 70% 时交由 Claude Code 压缩；模型实际窗口更小时，以较小值计算。可逐项目调整，例如 `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`。窗口可设 100000–1000000，百分比可设 1–90；实际效果还取决于所用 CLI、模型和 Claude 设置。需要超过一小时的任务时，在项目 `limits.seconds` 中显式设置上限，最高 86400 秒，单项任务只能降低该上限。长日志请写文件并只返回结论、退出码与路径。
 
-一个写入任务正常交付阶段结果后，Codex 可核对产物与累计费用，再调用 `continue_task(..., fresh_session=true)` 在同一任务工作树开启全新 CC 会话；该模式不载入旧会话历史。若 CC 仍报上下文超限，任务会标为 `CONTEXT_LIMIT` 并保留写入工作树，自动接管会通知 Codex 核查。**不会自动重试已溢出的旧会话**；无需人审的阶段检查点与接力仍待实现和验收。直接在 Claude Code 中启动的后台作业不受 Codex1CC 任务机制管理。设计和剩余工作见[长程任务计划](docs/long-running-tasks-plan.md)。
+一个写入任务正常交付阶段结果后，Codex 可核对产物，再调用 `continue_task(..., fresh_session=true)` 在同一任务工作树开启全新 CC 会话；该模式不载入旧会话历史。若 CC 仍报上下文超限，任务会标为 `CONTEXT_LIMIT` 并保留写入工作树，自动接管会通知 Codex 核查。**不会自动重试已溢出的旧会话**；无需人审的阶段检查点与接力仍待实现和验收。直接在 Claude Code 中启动的后台作业不受 Codex1CC 任务机制管理。设计和剩余工作见[长程任务计划](docs/long-running-tasks-plan.md)。
 
 ### 可选：授权 CC 编码与测试（实验性）
 
@@ -106,7 +112,7 @@ Codex1CC 为自己启动的 CC 任务默认设置更早的自动压缩：将自�
 
 例如对 Codex 说：
 
-> 使用 $codex1cc-ops，把这项完整开发任务交给 demo 的 CC，允许读、写、执行测试，改动范围限 `src` 和 `tests`，使用自动接管。一次派清目标、验收条件和预算；完成后检查实际 diff、提交与测试证据。不要轮询，也不要自动重交。
+> 使用 $codex1cc-ops，把这项完整开发任务交给 demo 的 CC，允许读、写、执行测试，改动范围限 `src` 和 `tests`，使用自动接管。一次派清目标与验收条件；完成后检查实际 diff、提交与测试证据。不要轮询，也不要因 CC 费用提问或自动重交。
 
 结果会列出任务 worktree、基线与最终提交、未提交改动及超出声明范围的文件。CC 的 Bash 能访问本机文件和网络；`write_paths` 与 `scope` 不能提供硬隔离。不要在不信任的仓库或含敏感凭据的环境中启用。取消或失败会保留任务 worktree，供人工核对；若 CLI 失败但产物有效，Codex 核对证据后可显式验收，并保留原失败原因。仅写入由 Codex1CC 新建的任务；既有原生 CC 后台会话暂不接管。实现步骤见[写入后端计划](docs/native-write-backend-plan.md)。
 
@@ -195,7 +201,7 @@ Codex 会自行查询任务状态；你不需要记住工具名称或状态代�
 
 ## 5. 怎样给 CC 派任务
 
-用自然语言说清楚**想解决什么、要看哪些资料、怎样才算完成、希望得到什么结论**。有时间或费用要求，也一并告诉 Codex。Codex 负责核对授权范围并填写工具参数；你不需要写 JSON 或记住函数名。
+用自然语言说清楚**想解决什么、要看哪些资料、怎样才算完成、希望得到什么结论**。有时间要求，也一并告诉 Codex。Codex 负责核对授权范围并填写工具参数；你不需要写 JSON 或记住函数名，也不需要为 CC 费用限额作裁定。
 
 以下指令基于上文的 `demo` 配置；使用时换成你的项目名和资料范围：
 
@@ -236,7 +242,7 @@ Codex 会读取这项任务已保存的运行事件，并把原始记录整理�
 ## 7. 给 Codex 的执行约定（AI 可直接读取）
 
 1. 先确认用户说的项目对应已配置的 `project_id`；不要只凭当前目录猜测 ID。进入新会话时按需调用一次 `list_tasks(project_id=..., statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])`，只对待处理项调用 `get_task`。
-2. 对一项完整、边界清楚的目标只调用一次 `submit_task`。把目标、背景、验收标准、交付物、配置中允许的 `scope`、预算和提问规则一次传清；`request_id` 唯一且重试复用。
+2. 对一项完整、边界清楚的目标只调用一次 `submit_task`。把目标、背景、验收标准、交付物、配置中允许的 `scope`、时间上限和提问规则一次传清；`request_id` 唯一且重试复用。
 3. 用户要求自动接管时传 `handoff="automatic"`，报告提交返回的接管状态；默认手动模式保持原用法。提交后给用户任务 ID，即结束本轮。不按定时器调用 `list_tasks`/`get_task`。
 4. 用户明确要看运行进展时，调用 `get_task(include_events=true)`。已知上次游标就从该游标读取；否则从 0 开始，按 `has_more` 和 `next_cursor` 在同一次查询中翻到最新记录。概括有证据的文件操作和发现，不把原始事件流或推测当成已完成工作；不要设置定时查询。
 5. 自动接管事件送达时，先用 `get_task` 核对原要求、当前状态和证据，再回答、验收、续接或请求用户决定；处理后调用 `ack_handoff` 记录结果。手动模式在下次自然交互中做同样检查。`failed`/`interrupted` 不自动重试。
@@ -246,7 +252,7 @@ Codex 会读取这项任务已保存的运行事件，并把原始记录整理�
 
 Linux 只读任务使用 bubblewrap 隔离快照，只开放读取、搜索和内部提问；缺少隔离环境时该模式失败。原生写入任务在 Git worktree 中运行，CC 可编辑和执行命令，**不继承只读模式的文件隔离保证**。此 alpha 尚未完成跨机器和 macOS 验证。
 
-任务秒数、轮数与费用有项目上限。Claude CLI 报告的 USD 费用用于限额判断，可能与服务商最终账单不同；缺失费用报告时不允许继续下一轮。CC 使用你自己的 Claude Code 认证与模型服务。任务数据、事件和快照保存在运行工具的电脑上，可通过 `codex1cc doctor` 查看路径。
+任务仍受时间、轮数、授权范围和验收条件约束。Codex1CC 不设置 CC 的 USD 调用上限，也不因缺少费用报告停止接力；CLI 若提供费用数据，仅作为可选用量记录，不能视为最终账单。节省 token 依靠完整派单、共享公共信息、按事件接管、独立会话、提前压缩与简短交付。CC 使用你自己的 Claude Code 认证与模型服务。任务数据、事件和快照保存在运行工具的电脑上，可通过 `codex1cc doctor` 查看路径。
 
 ## 9. 常见问题
 
@@ -254,7 +260,7 @@ Linux 只读任务使用 bubblewrap 隔离快照，只开放读取、搜索和�
 |---|---|
 | 找不到 MCP 工具 | `codex mcp list`；检查注册命令的绝对路径，重启或刷新 Codex。 |
 | `PROJECT_NOT_ALLOWED` | 核对项目 ID、共享文件和 `scope` 是否逐项等于 `read_paths` 中的条目；检查路径中的符号链接、特殊文件。 |
-| `LIMIT_REACHED` | 缩小文件范围，或在项目授权上限内降低任务规模；检查时间、费用、轮数及快照大小。 |
+| `LIMIT_REACHED` | 缩小文件范围，或在项目授权上限内降低任务规模；检查时间、轮数及快照大小。 |
 | `SANDBOX_UNAVAILABLE` | Linux 上检查 `bwrap` 和用户命名空间；macOS 的真实任务暂未开放。 |
 | `HANDOFF_UNAVAILABLE` | 检查 `codex app-server daemon start`、`codex1cc doctor` 及绑定的会话；普通空会话和不支持恢复的历史记录不能用于自动接管。 |
 | `CLI_FAILED` | 运行 `codex1cc doctor`，再检查 Claude Code 的认证、服务端地址及模型 ID。`doctor` 不会替你验证模型调用。 |

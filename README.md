@@ -10,32 +10,38 @@ Install Codex1CC where it can access your project files and Claude Code. Codex c
 
 Licensed under MIT; see [LICENSE](LICENSE).
 
-Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), [long-running task plan](docs/long-running-tasks-plan.md), [parallel agent plan](docs/parallel-agents-plan.md), and [PRD v1.5](Codex1CC%20产品需求文档.md). Manual use remains available.
+Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), [long-running task plan](docs/long-running-tasks-plan.md), [parallel agent plan](docs/parallel-agents-plan.md), and [PRD v1.6](Codex1CC%20产品需求文档.md). Manual use remains available.
 
 ## How the pieces fit together
 
 ```mermaid
 flowchart TD
-    U[User] --> C[Codex conversation]
-    S[codex1cc-ops skill<br/>operating instructions] -. guides .-> C
-    C --> M[Codex1CC MCP tools]
-    M --> E[Task executor]
+    U[User] --> C[Codex checks dependencies and delegates]
+    S[codex1cc-ops skill] -. guidance .-> C
+    C --> M[Codex1CC MCP tools] --> E[Background executor]
     CLI[codex1cc CLI<br/>doctor / bind / watch] --> E
-    CFG[Project authorization config<br/>paths / budgets / binding] --> E
-    E <--> DB[(Tasks / events / handoff records)]
-    E --> MODE{Task permission}
-    MODE -->|read only| SNAP[Authorized path snapshot]
-    SNAP --> BOX[Linux isolated runner]
-    MODE -->|write explicitly enabled| WT[Separate Git worktree]
-    BOX --> CC[Claude Code]
-    WT --> CC
-    CC -->|result / question / failure| E
-    E -->|automatic event| H[Codex App Server handoff host]
-    H --> D[Dedicated Codex session]
-    D -->|check / answer / continue / review / receipt| M
+    CFG[Project config<br/>authorized paths / time and rounds / handoff<br/>three concurrent tasks by default] --> E
+    E <--> DB[(Tasks / sessions / events / usage)]
+    E --> A{When tasks are active<br/>both parallel_ok / paths separate / capacity available}
+    A -->|accepted| T[Independent execution unit per task]
+    A -->|serial declaration, conflict, or limit| BUSY[PROJECT_BUSY<br/>review prior work and verify new Git baseline]
+    BUSY -. Codex decides later submission .-> C
+    T --> MODE{Task permission}
+    MODE -->|read only| SNAP[Authorized file snapshot] --> BOX[Linux isolated runner] --> CCR[Separate CC process and session]
+    MODE -->|write authorized| WT[Separate branch and Git worktree] --> CCW[Separate CC process and session]
+    CFG -. early compaction settings and time limit .-> CCR
+    CFG -. early compaction settings and time limit .-> CCW
+    CCR --> EV[Result / question / failure event]
+    CCW --> EV
+    EV --> DB
+    EV -->|automatic handoff| H[Codex App Server handoff host] --> D[Bound dedicated Codex session]
+    D -->|inspect / answer / review / acknowledge| M
+    D -->|reviewed write phase| F[continue_task fresh_session] --> E
+    E -->|reuse worktree, start new session| CCW
+    EV -->|context overflow| X[Record CONTEXT_LIMIT<br/>retain write worktree, no old-session retry]
 ```
 
-Codex submits one complete task through MCP. The executor checks project authorization and budget, then uses either a read-only snapshot or a write-enabled worktree. CC results and events are saved with the task. In manual mode, ask Codex to check and review them later. In automatic mode, a result, question, or failure wakes the bound dedicated Codex session, which handles the event and saves its conclusion. `codex1cc watch TASK_ID` waits for program events without repeated model calls. Write task commits remain on their separate branch; review does not merge or push them.
+Codex decides which tasks are genuinely independent. The executor checks declared paths, `parallel_ok`, and the per-project limit. Up to three tasks may run by default, but tasks without an explicit parallel declaration remain serial. Each task keeps its own session, events, and usage; write tasks also have separate branches and worktrees. A conflict returns `PROJECT_BUSY`; Codex submits follow-up work only after reviewing the prior result and verifying its Git baseline. Manual mode supports on-demand checks, while automatic handoff wakes the bound Codex session for questions, deliveries, or failures. `watch` waits for program events without repeated model calls. A reviewed write phase can continue in its worktree with a fresh CC session; context overflow retains the worktree without retrying the old session. Review does not merge or push commits.
 
 ## Requirements
 
@@ -63,12 +69,12 @@ Edit the displayed JSON config. Keep it readable only by your user (mode 0600). 
           "shared_context": "CODEX1CC_CONTEXT.md",
           "read_paths": ["README.md", "docs", "src"],
           "model": "your-working-model-id",
-          "limits": {"seconds": 1800, "usd": 0.25, "rounds": 3}
+          "limits": {"seconds": 1800, "rounds": 3}
         }
       }
     }
 
-Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. The configured `seconds`, `usd`, and `rounds` are project caps. A task can lower its time and USD caps, while the round cap comes from project configuration.
+Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. The configured `seconds` and `rounds` are project caps. A task can lower its time cap; legacy project `limits.usd` is ignored and new task `limits.usd` is rejected.
 
 Create the shared context file inside the target project before submitting a task. Record authoritative document paths, stable constraints, and reusable public facts; exclude credentials and unverified status claims. Claude receives a fixed copy even if it is not in the requested `scope`. For read-only tasks, selected paths are copied into a private snapshot; symbolic links and special files are rejected. Each task path must exactly match a configured `read_paths` entry: if `docs` is allowed, request `docs`, not an unlisted `docs/file.md`. Exclude generated assets and caches; a read-only snapshot is limited to 20 MiB and 2000 files.
 
@@ -80,7 +86,7 @@ After a write task delivers a reviewed phase, Codex can check the artifacts and 
 
 ### Optional native CC editing (experimental)
 
-For a Git repository you trust, add `"write_backend": {"enabled": true, "write_paths": ["src", "tests", "docs"]}` to its project configuration. The root must be the repository top level. Use `["."]` to explicitly allow the full repository. Ask Codex to submit a development task with `actions=["read","write","execute"]`, a narrower `scope`, acceptance checks, and a budget. Codex1CC creates a `codex1cc/<task_id>` branch and a separate worktree from the current `HEAD`; uncommitted changes in the original workspace are not included. CC may make local commits. No merge or push is performed by Codex1CC.
+For a Git repository you trust, add `"write_backend": {"enabled": true, "write_paths": ["src", "tests", "docs"]}` to its project configuration. The root must be the repository top level. Use `["."]` to explicitly allow the full repository. Ask Codex to submit a development task with `actions=["read","write","execute"]`, a narrower `scope`, acceptance checks, and a time limit. Codex1CC creates a `codex1cc/<task_id>` branch and a separate worktree from the current `HEAD`; uncommitted changes in the original workspace are not included. CC may make local commits. No merge or push is performed by Codex1CC.
 
 > Use $codex1cc-ops to delegate this complete development task in demo to CC with read, write, and test execution. Limit changed paths to `src` and `tests`, use automatic handoff, and review the actual diff, commits, and test evidence when CC finishes. Submit once; do not poll or retry automatically.
 
@@ -98,7 +104,7 @@ Register the MCP server explicitly in Codex after reviewing the command:
 
 Find that absolute executable path with command -v codex1cc. Use the path in the registration so a Codex client launched with a different PATH can still start the server.
 
-Codex should submit one cohesive task with objective, task-specific context, acceptance checks, deliverables, path scope, time and budget limits, and a request ID. On the next natural interaction, call list_tasks, then get_task for the task needing an answer or review. Only complete_task after checking the actual result.
+Codex should submit one cohesive task with objective, task-specific context, acceptance checks, deliverables, path scope, time limit, and a request ID. Codex does not set or negotiate CC cost limits. On the next natural interaction, call list_tasks, then get_task for the task needing an answer or review. Only complete_task after checking the actual result.
 
 ### Use the `$codex1cc-ops` skill
 
@@ -227,7 +233,7 @@ Restricted Claude sessions inherit only selected Anthropic authentication, endpo
 
 Linux read-only tasks use bubblewrap to expose only a private snapshot, Claude's own configuration and session data, the internal question tool, and its local socket. This runner does not expose command execution, WebFetch or browser tools. Native write tasks instead run with trusted-project command access in a Git worktree and do not use this isolation boundary.
 
-The CLI budget flag limits a single invocation; previous rounds are tracked separately. If reported cost is missing, continuation fails closed. The CLI's figures may differ from your provider's actual bill.
+Codex1CC does not set a CC USD limit. Reported cost is optional telemetry and may differ from the provider bill; missing cost data does not block continuation. Token savings come from cohesive tasks, shared facts, event handoff, independent sessions, early compaction, and concise results.
 
 Completed, failed and canceled read-only task content is retained for 30 days, then pruned when the executor starts. Write task worktrees and review records require explicit cleanup. Tasks still waiting for an answer or review are not pruned. Claude's own session files are managed by Claude Code.
 
@@ -248,7 +254,7 @@ See the [validation record](docs/validation.md) for the tested versions and rema
 
 - **SANDBOX_UNAVAILABLE:** Install bubblewrap on Linux and confirm unprivileged namespaces are permitted. On macOS, the isolation backend is not implemented yet.
 - **PROJECT_NOT_ALLOWED:** Check that the project ID exists, every task scope entry exactly matches a configured project-relative `read_paths` entry, and the shared file exists. Symlinks and special files are rejected.
-- **LIMIT_REACHED:** Narrow the scope, or check the configured time, USD, round, and snapshot limits.
+- **LIMIT_REACHED:** Narrow the scope, or check the configured time, round, and snapshot limits.
 - **HANDOFF_UNAVAILABLE:** Check the managed App Server, `codex1cc doctor`, and the bound resumable session.
 - **CLI_FAILED:** Run codex1cc doctor, then check your Claude Code authentication, endpoint and model ID. A model rejected by its service is not a Codex1CC task success.
 - **Task interrupted:** The executor restarted while a round was active. Review the snapshot and recorded events; it never replays an uncertain round automatically.

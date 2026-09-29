@@ -60,3 +60,9 @@ These results support a local Linux read-only alpha, not a complete cross-platfo
 
 - The same **37 fake-CLI tests** include two independent read-only tasks observed running simultaneously, two independent write tasks with separate worktrees, and admission refusal for overlapping scopes, parent-directory scopes, the configured agent limit, or tasks that do not opt in. The state database migrated from schema 2 to 3 with a backup and no loss of old task records.
 - Project `parallel.max_agents` defaults to 3 and permits 1–4; each task must explicitly set `parallel_ok=true` to join concurrent work. This is process/session isolation, not Claude's built-in Agent tool or a command sandbox. Automatic conflict queues and dependency graphs are not implemented. A real two-model concurrent run and downstream Git baseline integration remain unverified.
+
+## CC cost policy (2026-09-30)
+
+- The fake-CLI suite passed **39 tests**. New cases verify that task `limits.usd` is rejected and a reviewed write task can start a fresh CC session when the CLI reports no cost; the spawned CLI receives no `--max-budget-usd` flag.
+- Existing project `limits.usd` values are ignored by the new executor. Previously started Claude processes retain their original command-line arguments until they exit; installing the new version does not rewrite a running task. CLI-reported cost remains optional telemetry. Time, round, scope, and review checks remain active.
+- This policy has not been tested with a real multi-hour model run or a real failed task recovery. It does not establish a provider billing cap.

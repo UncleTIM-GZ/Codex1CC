@@ -35,7 +35,7 @@ def cli_ready(cli: str) -> None:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BridgeError("CLI_FAILED", "Claude CLI capability check failed") from exc
     required = ("--print", "--output-format", "--permission-mode", "--tools",
-                "--max-budget-usd", "--strict-mcp-config", "--resume")
+                "--strict-mcp-config", "--resume")
     if result.returncode or any(flag not in result.stdout for flag in required):
         raise BridgeError("CLI_FAILED", "Claude CLI lacks native write requirements")
 

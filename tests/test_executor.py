@@ -118,6 +118,15 @@ class ExecutorTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "PROJECT_NOT_ALLOWED")
 
+    def test_task_cannot_set_a_cc_cost_limit(self) -> None:
+        result = self.call("submit_task", {
+            "project_id": "sample", "objective": "Inspect README",
+            "acceptance": ["done"], "deliverables": ["result"],
+            "scope": ["README.txt"], "limits": {"usd": 0.85},
+            "request_id": uuid.uuid4().hex})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_ARGUMENT")
+
     def test_edit_action_fails_closed(self) -> None:
         result = self.call("submit_task", {
             "project_id": "sample", "objective": "Edit a file",
@@ -353,6 +362,47 @@ class ExecutorTest(unittest.TestCase):
         self.assertEqual(second["session_id"], "new-session")
         self.assertEqual(second["result"]["workspace"]["worktree_path"], original_worktree)
         self.assertAlmostEqual(second["usage"]["total_cost_usd"], 0.03)
+
+    def test_unknown_cost_does_not_block_fresh_write_session(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "if '--max-budget-usd' in sys.argv: sys.exit(2)\n"
+            "path=pathlib.Path('README.txt')\n"
+            "phase='one' if path.read_text() == 'public task content' else 'two'\n"
+            "path.write_text('phase ' + phase)\n"
+            "print(json.dumps({'type':'result','session_id':'session-'+phase,"
+            "'result':'phase '+phase,'is_error':False}),flush=True)\n",
+            encoding="utf-8")
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Two phases", "context": "",
+            "acceptance": ["Phase two done"], "deliverables": ["Diff"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        task_id = started["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            first = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if first["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(first["status"], "review_required", first)
+        self.assertIsNone(first["usage"]["total_cost_usd"])
+        continued = self.call("continue_task", {
+            "task_id": task_id, "instruction": "Finish phase two", "fresh_session": True,
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(continued["ok"], continued)
+        while time.monotonic() < deadline:
+            second = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if second["status"] == "review_required" and second["round_no"] == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(second["status"], "review_required", second)
+        self.assertEqual(second["result"]["conclusion"], "phase two")
 
     def test_fresh_session_relay_rejects_read_only_task(self) -> None:
         started = self.call("submit_task", {

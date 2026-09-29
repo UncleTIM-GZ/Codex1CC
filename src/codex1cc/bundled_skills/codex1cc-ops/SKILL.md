@@ -76,7 +76,8 @@ For automatic handoff, require the project to be connected in
 Call `list_tasks` once for active statuses before submission. Do not submit a
 duplicate. Build one cohesive task with the complete objective, relevant public
 context, measurable acceptance criteria, expected deliverables, exact authorized
-scope, limits, and question policy. Keep linked small steps together. Split work
+scope, time and round limits, and question policy. Do not set or negotiate a CC
+USD limit; cost is optional usage telemetry, not an approval gate. Keep linked small steps together. Split work
 only when tasks are truly independent. The default project limit is 3; for
 parallel work in one project, require an effective `parallel.max_agents > 1`
 and explicit authorization that the tasks are
@@ -101,9 +102,12 @@ When Codex1CC delivers a question, result, failure, or interruption:
 
 1. Call `get_task` for that task and verify the current state, original
    acceptance criteria, evidence, and pending question before acting.
-2. Answer only when the existing evidence determines the answer. Ask the user
-   when the event needs a product choice, new permission, broader scope, or
-   additional budget.
+2. Answer when the existing evidence and acceptance criteria determine the
+   answer. Ask the user for a genuine product choice or new project permission.
+   If the current task scope is too narrow but the original objective and
+   project write authorization already cover the needed files, review the
+   partial result and submit a new scoped follow-up from a verified Git baseline.
+   Do not ask for approval solely to raise a CC cost limit or change a task scope.
 3. For write tasks, inspect the actual branch diff, commits, dirty files,
    outside-scope report, and test evidence. Treat CC's claims as unverified.
    Review evidence before `complete_task`. Use `continue_task` only for a
@@ -113,8 +117,8 @@ When Codex1CC delivers a question, result, failure, or interruption:
    may explicitly accept it while retaining the original failure reason.
    Keep the worktree until the user explicitly
    requests cleanup; do not merge, push, or deploy on task completion alone.
-   When a reviewed write task has a documented next phase and known remaining
-   budget, use `continue_task(..., fresh_session=true)` if a new context is
+   When a reviewed write task has a documented next phase, use
+   `continue_task(..., fresh_session=true)` if a new context is
    needed. Check the existing commits, dirty files, and test evidence first;
    this starts a new CC session in the same managed worktree and counts as a
    new round.
@@ -137,10 +141,10 @@ the original turn and its effects are verified; otherwise leave it for user
 review.
 
 On `CONTEXT_LIMIT`, inspect the retained task worktree, commits, changed files,
-test logs, and remaining budget. Do not resume or retry the overflowing Claude
-session. A fresh-session relay is available only after a write task has normally
-reached `review_required`, its work has been reviewed, and its remaining budget
-is known. A failed task needs an explicit review and a new scoped task on a
+and test logs. Do not resume or retry the overflowing Claude session. A
+fresh-session relay is available only after a write task has normally reached
+`review_required` and its work has been reviewed. A failed task needs an
+explicit review and a new scoped task on a
 verified Git baseline; do not silently restart it. Do not claim to manage Claude
 background jobs that were started outside Codex1CC.
 

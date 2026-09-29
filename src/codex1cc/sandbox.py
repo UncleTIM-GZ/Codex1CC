@@ -56,7 +56,7 @@ def wrap_linux(cli: str, command: list[str], snapshot: Path, mcp_config: Path) -
         raise BridgeError("CLI_FAILED", "Claude CLI capability check failed") from exc
     required = ("--print", "--output-format", "--restricted", "--strict-mcp-config",
                 "--mcp-config", "--tools", "--allowedTools", "--permission-mode",
-                "--max-budget-usd", "--resume")
+                "--resume")
     if help_result.returncode or any(flag not in help_result.stdout for flag in required):
         raise BridgeError("CLI_FAILED", "Claude CLI lacks a required capability")
     source_root = Path(__file__).resolve().parents[1]

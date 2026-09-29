@@ -214,7 +214,7 @@ class Executor:
             f"event_id={event['id']} task_id={event['task_id']} kind={event['kind']} "
             f"round_no={event['round_no']} receipt_token={event['receipt_token']}。\n"
             "先用 get_task 读取当前任务与原验收条件，并核对状态。只按需读取详细事件或产物。"
-            "需要用户决定时明确说明并停止自动续接；不要扩大权限或预算。"
+            "只在真实产品取舍或超出项目授权时请求用户裁定；不要为 CC 费用提问。"
             "处理结束时调用 ack_handoff(event_id, receipt_token, outcome)，其中 outcome 为 "
             "completed、answered、continued、needs_user、reviewed 或 failed。"
             "向用户给出简短结论和下一步。"
@@ -455,11 +455,8 @@ class Executor:
         max_seconds = self._number(limits.get("seconds", configured_max), 1, 86400)
         if max_seconds > configured_max:
             raise BridgeError("LIMIT_REACHED", "Task time exceeds project limit")
-        project_budget = project.get("limits", {}).get("usd", 0.25)
-        budget = limits.get("usd", project_budget)
-        if (type(budget) not in (float, int) or type(project_budget) not in (float, int)
-                or not 0 < budget <= project_budget <= 100):
-            raise BridgeError("LIMIT_REACHED", "Invalid or excessive task budget")
+        if "usd" in limits:
+            raise BridgeError("INVALID_ARGUMENT", "CC cost is not a task limit; omit limits.usd")
         max_rounds = self._number(project.get("limits", {}).get("rounds", 3), 1, 10)
         requested_handoff = params.get("handoff", "manual")
         if not isinstance(requested_handoff, str) or requested_handoff not in {"manual", "automatic"}:
@@ -494,7 +491,7 @@ class Executor:
                   "parallel_ok": parallel_ok,
                   "task_id": task_id,
                   "backend": "native_write" if write_task else "read_only", "workspace": workspace,
-                  "limits": {"seconds": max_seconds, "usd": float(budget), "rounds": max_rounds},
+                  "limits": {"seconds": max_seconds, "rounds": max_rounds},
                   "question_policy": question_policy,
                   "shared_context": project["shared_context"], "snapshot_sha256": digest,
                   "snapshot_info": snapshot_info, "handoff": binding}
@@ -542,15 +539,8 @@ class Executor:
             raise BridgeError("INVALID_STATE", "Fresh-session relay requires a reviewed write task")
         if item["bundle"].get("backend") == "native_write":
             verify_worktree(item["project"]["root"], item["bundle"]["workspace"])
-            if item["status"] == "interrupted" and not isinstance(
-                    (item["usage"] or {}).get("total_cost_usd"), (int, float)):
-                raise BridgeError("LIMIT_REACHED", "Interrupted round cost is unknown; inspect worktree before a new task")
         if item["round_no"] >= item["bundle"]["limits"]["rounds"]:
             raise BridgeError("LIMIT_REACHED", "Task round limit reached")
-        if item["usage"]:
-            observed = item["usage"].get("total_cost_usd")
-            if not isinstance(observed, (int, float)) or observed >= item["bundle"]["limits"]["usd"]:
-                raise BridgeError("LIMIT_REACHED", "Task budget reached or cost is unknown")
         instruction = self._text(params.get("instruction"), "instruction")
         self._admit_parallel(item["project_id"], item["project"], item["bundle"], item["id"])
         round_no = item["round_no"] + 1
@@ -694,23 +684,15 @@ class Executor:
             "command": str(Path(sys.executable).resolve()),
             "args": ["-m", "codex1cc.question_server"]}}})
         prior_cost = (item["usage"] or {}).get("total_cost_usd", 0)
-        if not isinstance(prior_cost, (int, float)):
-            self._fail(task_id, "LIMIT_REACHED", "Task cost is unknown")
-            return
-        remaining_budget = bundle["limits"]["usd"] - prior_cost
-        if remaining_budget <= 0:
-            self._fail(task_id, "LIMIT_REACHED", "Task budget reached")
-            return
         command = [cli, "-p", "--output-format", "stream-json", "--verbose"]
         if write_task:
             command += ["--permission-mode", "bypassPermissions", "--strict-mcp-config",
-                        "--mcp-config", str(mcp_config), "--tools", "Read,Glob,Grep,Edit,Write,Bash",
-                        "--max-budget-usd", str(remaining_budget)]
+                        "--mcp-config", str(mcp_config), "--tools", "Read,Glob,Grep,Edit,Write,Bash"]
         else:
             command += ["--restricted", "--permission-mode", "dontAsk",
                         "--strict-mcp-config", "--mcp-config", str(mcp_config),
                         "--allowedTools", "Read", "Glob", "Grep", "mcp__codex1cc_questions__ask_codex",
-                        "--tools", "Read,Glob,Grep", "--max-budget-usd", str(remaining_budget)]
+                        "--tools", "Read,Glob,Grep"]
         if project.get("model"):
             command += ["--model", project["model"]]
         if item["session_id"] and not fresh_session:
@@ -821,7 +803,8 @@ class Executor:
                     self._fail(task_id, exc.code, str(exc))
                     return
             round_cost = result.get("total_cost_usd")
-            total_cost = prior_cost + round_cost if isinstance(round_cost, (int, float)) else None
+            total_cost = (prior_cost + round_cost if isinstance(prior_cost, (int, float))
+                          and isinstance(round_cost, (int, float)) else None)
             usage = {"total_cost_usd": total_cost, "last_round": result.get("usage")}
             self.store.transition(task_id, "review_required", summary, status="review_required", exit_code=code,
                                   result_json=json.dumps(scrub(summary), ensure_ascii=False),
@@ -849,6 +832,7 @@ class Executor:
                 f"验收标准：{json.dumps(bundle['acceptance'], ensure_ascii=False)}\n"
                 f"交付物：{json.dumps(bundle['deliverables'], ensure_ascii=False)}\n"
                 f"提问规则：{bundle['question_policy']}\n"
+                "不要为 CC 费用或预算提问；只提真正阻塞目标的产品或授权问题。"
                 "最终交付简短结论、逐项验收结果、提交与测试证据及未解决阻塞。"
             )
         return (
@@ -856,6 +840,7 @@ class Executor:
             f"共享文件：{bundle['shared_context']}\n验收标准：{json.dumps(bundle['acceptance'], ensure_ascii=False)}\n"
             f"交付物：{json.dumps(bundle['deliverables'], ensure_ascii=False)}\n"
             f"提问规则：{bundle['question_policy']}\n"
+            "不要为 CC 费用或预算提问；只提真正阻塞目标的产品或授权问题。"
             "只读取当前工作目录中的文件。最终只交付结论、逐项验收结果、产物路径和阻塞项；"
             "每项最多一句，总计尽量不超过 300 字。"
         )
