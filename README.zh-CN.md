@@ -2,11 +2,13 @@
 
 [English README](README.md) · [产品需求文档](Codex1CC%20产品需求文档.md) · [验证记录](docs/validation.md)
 
-Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 CC），稍后再让 Codex 检查结果。你用自然语言下指令；CC 只读取你授权的项目文件并给出结论。即使关闭 Codex 对话，任务记录仍保存在运行工具的电脑上，重新打开 Codex 后可以继续查看。
+Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 CC），由 Codex 检查结果。你用自然语言下指令；CC 只读取你授权的项目文件并给出结论。即使关闭 Codex 对话，任务记录仍保存在运行工具的电脑上，重新打开 Codex 后可以继续查看。
 
-这个工具需要安装在能够访问项目文件和 Claude Code 的电脑上。安装后，Codex 通过 MCP（连接外部工具的接口）调用它；你无需自行运行网页服务。工具不会主动提醒你任务已完成，也不会唤醒已关闭的对话。
+这个工具需要安装在能够访问项目文件和 Claude Code 的电脑上。安装后，Codex 通过 MCP（连接外部工具的接口）调用它；你无需自行运行网页服务。可选的自动接管模式会在 CC 完成、提问或异常时启动已绑定的 Codex 会话；运行记录也可用命令行查看。自动处理结果保存在任务记录中，不保证弹出原来的 Codex 窗口。
 
 **当前是 alpha 只读版。** Linux + bubblewrap 已通过开发环境的真实任务测试；WSL 走 Linux 路径。macOS 的真实任务隔离尚未实现，原生 Windows 未支持。CC 不能修改项目、运行项目命令或执行发布。完整 v1 发布门槛见 [验证记录](docs/validation.md)。
+
+自动接管按 [PRD v1.2](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试和一次真实 CC → Codex 自动验收已通过。宿主运行中重启恢复、真实问题交接及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
 
 ## 1. 安装前准备
 
@@ -21,6 +23,7 @@ Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 
 git clone https://github.com/UncleTIM-GZ/Codex1CC.git
 cd Codex1CC
 uv tool install .                 # 或 pipx install .
+codex1cc install-skill            # 安装用户级 $codex1cc-ops Skill
 codex1cc init-config             # 首次创建配置；已存在时不要重复运行
 codex1cc config-path
 codex1cc doctor
@@ -34,7 +37,7 @@ codex mcp add codex1cc -- /absolute/path/to/codex1cc mcp
 codex mcp list
 ```
 
-应看到 `codex1cc` 已启用。若 Codex 会话在注册之前已打开，重启或刷新客户端。`doctor` 会按需启动后台程序，只检查基础运行条件；它不验证模型账号、服务端模型 ID 或目标项目的任务结果。Codex CLI 的项目目录和 MCP 配置方式见 [官方 OpenAI 文档：CLI](https://learn.chatgpt.com/docs/codex/cli)及 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
+应看到 `codex1cc` 已启用。若 Codex 会话在注册或 Skill 安装之前已打开，重启或刷新客户端。`doctor` 会按需启动后台程序，只检查基础运行条件；它不验证模型账号、服务端模型 ID 或目标项目的任务结果。升级 Codex1CC 后可运行 `codex1cc install-skill --force` 更新其管理的 Skill 文件；若用户改过这些文件，不加 `--force` 时安装器会拒绝覆盖。Codex CLI 的项目目录、Skill 和 MCP 配置方式见 [官方 OpenAI 文档：Skills](https://learn.chatgpt.com/docs/build-skills)及 [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。
 
 ## 3. 初始化一个授权项目（每个项目一次）
 
@@ -71,6 +74,44 @@ codex mcp list
 
 下面的操作示例使用 `demo` 项目；克隆 Codex1CC 仓库**不会自动授权任何项目**。首次配置后，可用 `codex1cc doctor` 检查运行条件；首次真实任务还需检查模型认证是否有效。
 
+### 开启自动接管（实验性）
+
+安装 `$codex1cc-ops` 后，可以直接让 Codex 执行生命周期操作，例如：
+
+> 使用 $codex1cc-ops 为 demo 创建专用自动接管绑定，完成后检查连接状态。
+
+> 使用 $codex1cc-ops 更新 demo 的自动接管绑定；先检查是否有活跃任务或未处理接管事件，没有阻塞时再创建新绑定。
+
+> 使用 $codex1cc-ops 把这项完整任务交给 demo 的 CC 并开启自动接管；只提交一次，完成、提问或失败时自动处理，不要轮询。
+
+> 使用 $codex1cc-ops 解绑 demo，并报告停用了多少待处理事件。
+
+Skill 会执行相应命令并验证结果。绑定或重绑到新专用会话会产生一次 Codex 模型调用；用户明确要求该操作后，Skill 会先说明费用影响再继续，不重复请求确认。也可以使用下面的命令手动操作。
+
+先安装支持 managed App Server 的 Codex 版本并确认其服务运行。以下命令在支持的版本中可用：
+
+```bash
+codex app-server daemon start
+codex1cc bind demo --create
+codex1cc doctor
+```
+
+`bind --create` 为该项目建立一个专用 Codex 会话，并用**一次实际模型调用**完成初始化；会产生费用，金额以服务商记录为准。已有可恢复的 legacy Codex 会话也可用 `codex1cc bind demo EXISTING_THREAD_ID` 绑定，这一步不调用模型。普通空会话和不支持恢复的会话会被拒绝。`doctor` 会显示连接情况，但不发起模型调用。
+
+派任务时告诉 Codex：
+
+> 请把这个完整任务交给 CC，使用 Codex1CC 自动接管模式；一次派清目标、范围和验收标准。提交后告诉我任务编号和接管是否已连接。CC 交付、提问或异常时自动接手，核对结果并给出结论；不要定时查询，也不要自动重交旧任务。
+
+Codex 应调用 `submit_task(..., handoff="automatic")`。如果接管预检失败，任务不会创建；`HANDOFF_UNAVAILABLE` 会说明原因。自动验收在专用 Codex 会话运行，结论会保存在任务的 `handoff` 记录中。可在原对话询问任务结果，或直接运行：
+
+```bash
+codex1cc watch TASK_ID
+```
+
+`watch` 等待程序事件并打印进度与最终记录，**不会为了监控反复调用模型**。关闭 `watch` 不影响后台任务。若要停止该项目后续自动接管，运行 `codex1cc unbind demo`；已经启动的 Codex 回合可能继续至结束。手动任务不需要绑定。宿主服务停止、电脑休眠或不支持的版本可能延迟接管；查看 `codex1cc doctor` 与任务的 `handoff` 状态。每项任务默认最多自动启动 3 次 Codex 回合，每回合默认最多 600 秒；项目配置中的 `handoff.max_turns` 和 `handoff.turn_seconds` 可在允许范围内调整。Codex 接管本身会消耗模型费用，当前宿主不提供可核实的 USD 用量，因此不能设置硬金额上限；等待期间不会产生监控模型调用。
+
+如果 `handoff` 显示 `needs_reconcile`，先查看任务记录中的 `turn_id`、原因和该 Codex 会话已保存的处理结果。确认原回合已结束且处理动作可核实后，可让 Codex 用原事件消息中的 `event_id` 和 `receipt_token` 调用 `ack_handoff` 显式结案；系统不会自动重投不确定的旧事件。如果原回合无法核对，可先 `unbind` 停用自动接管，再为后续任务绑定新的专用会话，并保留旧事件供人工排查。
+
 ## 4. 每次进入项目怎么开始
 
 在项目目录中启动 Codex；桌面或 IDE 客户端则打开该项目工作区。告诉 Codex 你要管理哪个已授权项目，例如上文配置的 `demo`。打开目录本身不会自动选定 Codex1CC 项目。
@@ -102,11 +143,11 @@ Codex 会自行查询任务状态；你不需要记住工具名称或状态代�
 
 > 看一下 demo 项目交给 CC 的任务现在进展如何。概括已经记录的文件读取、搜索、发现和卡点，告诉我最后一条记录的时间；如果没有新活动就直说。只查这一次，不要持续刷新。
 
-Codex 会读取这项任务已保存的运行事件，并把原始记录整理成人能看懂的进展。每次最多取 50 条事件；记录较多时，Codex 可以在**这一次查询中**翻页读完，再概括最近的活动。这不是 CC 屏幕的实时转播：CLI 不一定报告每个内部步骤，记录也可能被截短。当前没有自动推送进展或持续滚动的监视界面；你下次想看时再问一次即可。
+Codex 会读取这项任务已保存的运行事件，并把原始记录整理成人能看懂的进展。每次最多取 50 条事件；记录较多时，Codex 可以在**这一次查询中**翻页读完，再概括最近的活动。这不是 CC 屏幕的实时转播：CLI 不一定报告每个内部步骤，记录也可能被截短。不想使用模型概括进度时，可以运行 `codex1cc watch TASK_ID` 等待事件并查看原始记录；它不调用模型。普通进度不会自动唤起 Codex。
 
 ## 6. 稍后回来：回答、验收、继续或取消
 
-可以关闭 Codex 对话。下次从项目目录打开新对话，先按第 4 节查询。若手上只有任务编号，可说：
+手动模式下，可以关闭 Codex 对话；下次从项目目录打开新对话，先按第 4 节查询。自动模式的处理结论也会保存在任务记录中。若手上只有任务编号，可说：
 
 > 帮我看看 CC 上次的任务，编号是“这里填任务编号”。告诉我进展、需要回答的问题和结果；不要重新派发。
 
@@ -128,9 +169,9 @@ Codex 会读取这项任务已保存的运行事件，并把原始记录整理�
 
 1. 先确认用户说的项目对应已配置的 `project_id`；不要只凭当前目录猜测 ID。进入新会话时按需调用一次 `list_tasks(project_id=..., statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])`，只对待处理项调用 `get_task`。
 2. 对一项完整、边界清楚的目标只调用一次 `submit_task`。把目标、背景、验收标准、交付物、配置中允许的 `scope`、预算和提问规则一次传清；`request_id` 唯一且重试复用。
-3. 提交后给用户任务 ID 和已接受状态，即结束本轮。不按定时器调用 `list_tasks`/`get_task`，不占着对话等 CC 完成。
+3. 用户要求自动接管时传 `handoff="automatic"`，报告提交返回的接管状态；默认手动模式保持原用法。提交后给用户任务 ID，即结束本轮。不按定时器调用 `list_tasks`/`get_task`。
 4. 用户明确要看运行进展时，调用 `get_task(include_events=true)`。已知上次游标就从该游标读取；否则从 0 开始，按 `has_more` 和 `next_cursor` 在同一次查询中翻到最新记录。概括有证据的文件操作和发现，不把原始事件流或推测当成已完成工作；不要设置定时查询。
-5. 下次自然交互时检查 `waiting_answer` 或 `review_required`。回答用 `respond_task`；验收先看原要求与结果，再决定 `continue_task` 或 `complete_task`。`failed`/`interrupted` 不自动重试。
+5. 自动接管事件送达时，先用 `get_task` 核对原要求、当前状态和证据，再回答、验收、续接或请求用户决定；处理后调用 `ack_handoff` 记录结果。手动模式在下次自然交互中做同样检查。`failed`/`interrupted` 不自动重试。
 6. 只把可复用的公共事实写入项目共享文件；任务输出只交简短结论和证据。只在可独立并行的情况下拆任务。当前 CC 不能编辑或运行测试。
 
 ## 8. 限制、费用和隐私
@@ -147,6 +188,7 @@ Linux 使用 bubblewrap 隔离 CC 的只读快照；缺少隔离环境时任务�
 | `PROJECT_NOT_ALLOWED` | 核对项目 ID、共享文件和 `scope` 是否逐项等于 `read_paths` 中的条目；检查路径中的符号链接、特殊文件。 |
 | `LIMIT_REACHED` | 缩小文件范围，或在项目授权上限内降低任务规模；检查时间、费用、轮数及快照大小。 |
 | `SANDBOX_UNAVAILABLE` | Linux 上检查 `bwrap` 和用户命名空间；macOS 的真实任务暂未开放。 |
+| `HANDOFF_UNAVAILABLE` | 检查 `codex app-server daemon start`、`codex1cc doctor` 及绑定的会话；普通空会话和不支持恢复的历史记录不能用于自动接管。 |
 | `CLI_FAILED` | 运行 `codex1cc doctor`，再检查 Claude Code 的认证、服务端地址及模型 ID。`doctor` 不会替你验证模型调用。 |
 | 任务中断或问题过期 | 用 `get_task` 读状态和事件；问题等待超过 24 小时会过期。决定是否重新提交任务。 |
 

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from .common import rpc
+from .common import BridgeError, rpc
 
 server = FastMCP("Codex1CC", instructions=(
-    "Delegate one complete cohesive task. Do not poll. On the next natural interaction, "
-    "call list_tasks to find questions or reviewable results. Review artifacts before complete_task."
+    "Delegate one complete cohesive task. Do not poll. Automatic handoff requires a configured "
+    "Codex host binding and submit_task(handoff='automatic'). When handling a delivered event, "
+    "review the task and call ack_handoff after taking action. Review artifacts before complete_task."
 ))
 
 
@@ -16,13 +17,19 @@ server = FastMCP("Codex1CC", instructions=(
 async def submit_task(project_id: str, objective: str, context: str,
                       acceptance: list[str], deliverables: list[str], scope: list[str],
                       request_id: str, question_policy: str = "",
-                      limits: dict | None = None, actions: list[str] | None = None) -> dict:
+                      limits: dict | None = None, actions: list[str] | None = None,
+                      handoff: str = "manual") -> dict:
     """Submit one complete, bounded task to the configured project."""
+    if handoff == "automatic":
+        backend = await rpc("doctor")
+        if backend.get("protocol_version", 0) < 2:
+            raise BridgeError("HANDOFF_UNAVAILABLE", "Codex1CC executor must be upgraded and restarted")
     return await rpc("submit_task", {"project_id": project_id, "objective": objective,
                                      "context": context, "acceptance": acceptance,
                                      "deliverables": deliverables, "scope": scope,
                                      "request_id": request_id, "question_policy": question_policy,
-                                     "limits": limits or {}, "actions": actions or ["read"]})
+                                     "limits": limits or {}, "actions": actions or ["read"],
+                                     "handoff": handoff})
 
 
 @server.tool()
@@ -65,6 +72,13 @@ async def complete_task(task_id: str, review_note: str, request_id: str) -> dict
 async def cancel_task(task_id: str, request_id: str) -> dict:
     """Cancel only this executor-owned task; retain files and history."""
     return await rpc("cancel_task", {"task_id": task_id, "request_id": request_id})
+
+
+@server.tool()
+async def ack_handoff(event_id: str, receipt_token: str, outcome: str) -> dict:
+    """Confirm that a delivered event was handled in this Codex turn."""
+    return await rpc("ack_handoff", {"event_id": event_id,
+                                     "receipt_token": receipt_token, "outcome": outcome})
 
 
 def main() -> None:

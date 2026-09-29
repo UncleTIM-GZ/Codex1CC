@@ -62,9 +62,22 @@ def project_config(project_id: str) -> dict:
     cli = config.get("claude_path")
     if cli is not None and (not isinstance(cli, str) or not Path(cli).is_absolute() or not Path(cli).is_file()):
         raise BridgeError("INVALID_CONFIG", "claude_path must be an absolute executable file path")
+    handoff = config.get("handoff")
+    if handoff is not None:
+        if not isinstance(handoff, dict) or handoff.get("mode") != "automatic":
+            raise BridgeError("INVALID_CONFIG", "handoff must configure automatic mode")
+        thread_id = handoff.get("thread_id")
+        if not isinstance(thread_id, str) or len(thread_id) > 120 or not thread_id:
+            raise BridgeError("INVALID_CONFIG", "handoff.thread_id must name a Codex thread")
+        if any(key not in {"mode", "thread_id", "max_turns", "turn_seconds"} for key in handoff):
+            raise BridgeError("INVALID_CONFIG", "Unknown handoff setting; a hard USD cap is not supported")
+        if type(handoff.get("max_turns", 3)) is not int or not 1 <= handoff.get("max_turns", 3) <= 10:
+            raise BridgeError("INVALID_CONFIG", "handoff.max_turns must be 1 through 10")
+        if type(handoff.get("turn_seconds", 600)) is not int or not 30 <= handoff.get("turn_seconds", 600) <= 3600:
+            raise BridgeError("INVALID_CONFIG", "handoff.turn_seconds must be 30 through 3600")
     return {"root": str(root), "read_paths": paths, "shared_context": shared,
             "limits": limits, "claude_path": config.get("claude_path"),
-            "model": model}
+            "model": model, "handoff": handoff}
 
 
 def validate_relative(value: str) -> Path:

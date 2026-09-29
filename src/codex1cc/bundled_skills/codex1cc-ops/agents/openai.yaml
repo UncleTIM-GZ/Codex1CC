@@ -1,0 +1,12 @@
+interface:
+  display_name: "Codex1CC Operations"
+  short_description: "Bind projects and run automatic CC handoffs"
+  default_prompt: "Use $codex1cc-ops to enable automatic handoff for this project."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "codex1cc"
+      description: "Codex1CC task and handoff tools"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true

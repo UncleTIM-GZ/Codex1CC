@@ -1,14 +1,16 @@
 # Codex1CC
 
-Codex1CC lets you ask Codex to hand a well-defined task to Claude Code, then review the result with Codex later. You describe the task in plain language. Claude Code reads only the project files you authorize and returns its findings. The task record stays on the computer running the tool, so you can close Codex and check the result in a new conversation.
+Codex1CC lets you ask Codex to hand a well-defined task to Claude Code and review the result. You describe the task in plain language. Claude Code reads only the project files you authorize and returns its findings. The task record stays on the computer running the tool, so you can close Codex and check the result in a new conversation.
 
-Install Codex1CC where it can access your project files and Claude Code. Codex connects to it through MCP, a tool interface; you do not need to run a web service. Codex1CC does not notify you when a task finishes or wake a closed conversation.
+Install Codex1CC where it can access your project files and Claude Code. Codex connects to it through MCP, a tool interface; you do not need to run a web service. Optional automatic handoff starts a bound Codex session when CC finishes, asks a question, or fails. Results are saved with the task; the original Codex window may not reopen.
 
 **Status: alpha.** Linux has a read-only bubblewrap runner. A non-sensitive real task, blocking question, session resume, and Codex review passed locally. macOS isolation and broader platform acceptance are still release gates. Editing user projects is disabled. Do not use this as a security boundary for sensitive projects until those gates pass.
 
 **中文完整说明：**[安装、项目初始化、指挥 CC、跨会话验收与注意事项](README.zh-CN.md)。
 
 Licensed under MIT; see [LICENSE](LICENSE).
+
+Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), and [PRD v1.2](Codex1CC%20产品需求文档.md). Manual use remains available.
 
 ## Requirements
 
@@ -23,6 +25,7 @@ Install from a checkout using a Python tool environment:
 
     uv tool install .
     # or: pipx install .
+    codex1cc install-skill
     codex1cc init-config
     codex1cc config-path
 
@@ -48,7 +51,7 @@ Run diagnostics:
 
     codex1cc doctor
 
-The doctor command starts the background process if needed. It checks whether bubblewrap can launch; it does not prove that your model credentials or endpoint work.
+The doctor command starts the background process if needed. It checks whether bubblewrap can launch; it does not prove that your model credentials or endpoint work. `install-skill` installs the user-level `$codex1cc-ops` workflow so Codex can bind, rebind, unbind, submit, and handle automatic tasks on request. Restart an already open Codex client if the skill does not appear. After upgrading Codex1CC, run `codex1cc install-skill --force` to update its managed skill files; without `--force`, locally modified files are preserved and the command fails clearly.
 
 Register the MCP server explicitly in Codex after reviewing the command:
 
@@ -58,9 +61,39 @@ Find that absolute executable path with command -v codex1cc. Use the path in the
 
 Codex should submit one cohesive task with objective, task-specific context, acceptance checks, deliverables, path scope, time and budget limits, and a request ID. On the next natural interaction, call list_tasks, then get_task for the task needing an answer or review. Only complete_task after checking the actual result.
 
+## Optional automatic handoff (experimental)
+
+After installing `$codex1cc-ops`, ask Codex to execute lifecycle operations directly:
+
+> Use $codex1cc-ops to create a dedicated automatic handoff binding for demo and verify the connection.
+
+> Use $codex1cc-ops to rebind demo. Check for active tasks or unresolved handoffs first, then create the new binding only when it is clear.
+
+> Use $codex1cc-ops to delegate this complete task to CC with automatic handoff. Submit it once, then handle completion, questions, or failure without polling.
+
+> Use $codex1cc-ops to unbind demo and report how many pending events were disabled.
+
+The skill executes the relevant commands and verifies their results. Creating a new dedicated binding uses one Codex model call; after the user explicitly requests that operation, the skill explains the cost impact and proceeds without asking again. The commands below remain available for manual operation.
+
+On a Codex version with a managed App Server, start that service and bind a dedicated resumable session to your project:
+
+    codex app-server daemon start
+    codex1cc bind demo --create
+    codex1cc doctor
+
+`bind --create` makes **one real Codex model call** to initialize a persistent legacy session; charges are possible and the amount is not reported by this integration. To use an existing resumable legacy session without an initialization call, run `codex1cc bind demo EXISTING_THREAD_ID`. Empty sessions and unsupported history modes are rejected. `doctor` checks connectivity without invoking a model.
+
+Ask Codex: “Delegate this complete task to CC with Codex1CC automatic handoff. Give me the task ID and connection status. On completion, question, or failure, review it and report a conclusion. Do not poll or resubmit the old task.” Codex should pass `handoff="automatic"` to `submit_task`; preflight failure returns `HANDOFF_UNAVAILABLE` before creating a task. The handoff thread handles events and stores its result with the task. Watch progress and the saved conclusion without a model call:
+
+    codex1cc watch TASK_ID
+
+`codex1cc unbind demo` disables future automatic handoffs; a Codex turn already in progress may finish. The managed service must remain available for prompt delivery. Sleep, offline time, or an unsupported host can delay handling. A task defaults to at most three automatic Codex turns of 600 seconds each; `handoff.max_turns` and `handoff.turn_seconds` can narrow or raise these within documented bounds. The host does not expose verified USD usage, so this mode cannot enforce a hard money cap. Codex review and continuation calls may incur model charges; idle monitoring does not. See [host compatibility](docs/handoff-compatibility.md) for tested limits.
+
+If a handoff shows `needs_reconcile`, inspect its saved `turn_id`, reason, and Codex turn before taking action. Once the original turn and its actions are verified, Codex can call `ack_handoff` with the `event_id` and `receipt_token` from that turn's event message. An uncertain event is never automatically redelivered. If the turn cannot be reconciled, unbind the project and bind a new dedicated session for later tasks; keep the old event for manual investigation.
+
 ## Use Codex to direct Claude Code
 
-Codex submits and reviews one complete task; Claude Code (CC) reads a bounded snapshot and returns findings. Speak to Codex in natural language. Codex uses the `codex1cc` MCP tools. Task state persists locally across Codex conversations. Codex1CC does not notify you, poll Codex, or wake a closed conversation.
+Codex submits and reviews one complete task; Claude Code (CC) reads a bounded snapshot and returns findings. Speak to Codex in natural language. Codex uses the `codex1cc` MCP tools. Task state persists locally across Codex conversations. Manual mode requires a later check. Automatic mode starts the registered Codex handoff session on a task event without model polling; it may not reopen your original window.
 
 ### Start or re-enter an authorized project
 
@@ -95,7 +128,7 @@ You can ask Codex for a one-time progress check before the task finishes:
 
 > Check the CC task for the demo project. Summarize the recorded file reads, searches, findings, and blockers, and tell me when the last event occurred. If there is no new activity, say so. Check once; do not keep refreshing.
 
-Codex reads the saved execution events and turns them into a short account of observable progress. Each call returns at most 50 events; for a longer task, Codex can page through them **during that one check** to reach the newest events. This is not a live view of CC's screen: the CLI may omit internal steps, and long events may be truncated. There is no automatic progress notification or continuously updating monitor in this release. Ask again whenever you want another snapshot of progress.
+Codex reads the saved execution events and turns them into a short account of observable progress. Each call returns at most 50 events; for a longer task, Codex can page through them **during that one check** to reach the newest events. This is not a live view of CC's screen: the CLI may omit internal steps, and long events may be truncated. For a program-driven view, run `codex1cc watch TASK_ID`; it waits for events without calling a model. Ordinary progress does not wake Codex.
 
 ### Return later, answer, review, or cancel
 
@@ -123,9 +156,9 @@ The task content for completed, failed, and canceled tasks is pruned after 30 da
 
 1. Resolve the user's project name to an explicitly configured `project_id`; do not infer it from the current directory alone. On entering a session, call `list_tasks(project_id=..., statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])` once as needed and fetch only actionable tasks.
 2. Submit each cohesive objective once, with complete context, exact allowed `scope`, acceptance checks, deliverables, question policy, and bounded cost/time. Generate a unique `request_id` per operation; preserve it on retry.
-3. After `submit_task`, return the task ID and accepted status, then end the turn. Do not poll or hold the conversation open for CC.
+3. When the user requests automatic handoff, set `handoff="automatic"` and report the returned connection state. Otherwise use manual mode. Return the task ID and end the turn; do not poll for CC.
 4. When the user explicitly asks for progress, call `get_task(include_events=true)`. Start from the last cursor if known; otherwise start at 0 and use `has_more` and `next_cursor` to reach the newest events during this one check. Summarize only observed file activity and findings, not raw event streams or guessed completion. Never schedule repeated checks.
-5. On a later natural interaction, handle `waiting_answer` with `respond_task`, and `review_required` with evidence review followed by `continue_task` or `complete_task`. Never auto-replay `failed` or `interrupted` work.
+5. For an automatic event, call `get_task`, check the current state and original acceptance criteria, take an authorized action, then call `ack_handoff`. Manual mode handles the same states on a later interaction. Never auto-replay failed or interrupted work.
 6. Put reusable public facts in the project shared file; return concise conclusions and evidence. Delegate independent work separately only when it can run in parallel. CC cannot edit files or run project tests in this release.
 
 ## Authentication and safety
@@ -156,6 +189,7 @@ See the [validation record](docs/validation.md) for the tested versions and rema
 - **SANDBOX_UNAVAILABLE:** Install bubblewrap on Linux and confirm unprivileged namespaces are permitted. On macOS, the isolation backend is not implemented yet.
 - **PROJECT_NOT_ALLOWED:** Check that the project ID exists, every task scope entry exactly matches a configured project-relative `read_paths` entry, and the shared file exists. Symlinks and special files are rejected.
 - **LIMIT_REACHED:** Narrow the scope, or check the configured time, USD, round, and snapshot limits.
+- **HANDOFF_UNAVAILABLE:** Check the managed App Server, `codex1cc doctor`, and the bound resumable session.
 - **CLI_FAILED:** Run codex1cc doctor, then check your Claude Code authentication, endpoint and model ID. A model rejected by its service is not a Codex1CC task success.
 - **Task interrupted:** The executor restarted while a round was active. Review the snapshot and recorded events; it never replays an uncertain round automatically.
 - **QUESTION_EXPIRED:** A blocking question remained unanswered for 24 hours. Inspect the saved task before deciding whether a session can be continued.

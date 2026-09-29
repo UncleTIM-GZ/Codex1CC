@@ -32,3 +32,13 @@ The CLI reported a nonzero cumulative cost within the configured task limit. Thi
 - The CLI cost report has not been compared with the provider invoice.
 
 These results support a local Linux read-only alpha, not a complete cross-platform v1 release.
+
+## Experimental automatic handoff (2026-09-29)
+
+- Version 0.2.0 built as an sdist and wheel, installed locally with Python 3.10, and reported executor protocol version 2. The temporary handoff project's authorization and workspace were removed after the real test; the existing project configuration was preserved.
+- The new SQLite outbox persists task events, host turn IDs, delivery receipts, Codex conclusions, and retry/attention states. State transitions and their handoff events are committed together. Automatic mode is opt-in per task and requires a prevalidated project binding.
+- Automated tests: 23 passed locally, including the existing eight fake-CC tests, five fake end-to-end handoff tests, nine fake App Server protocol tests, and one database migration test. They cover completion, question then result, idempotent acknowledgement, explicit resolution of an uncertain turn, accepted-turn restart recovery, scoped MCP approval, host start/result correlation, busy-session event handling, and rejection of nonresumable sessions. No model request is made by these tests.
+- Managed Codex App Server 0.158.0 on local Linux: three minimal turns in a temporary, non-sensitive workspace demonstrated legacy-session initialization, turn/start with a turn ID, cross-connection turn/completed, and final-result retrieval. The host API did not provide verified USD cost data; cost is unknown.
+- `codex1cc bind PROJECT --create` initializes a dedicated legacy session with one real Codex model call. Binding an existing session only probes it. The normal doctor check does not call a model.
+- A real, non-sensitive CC → Codex handoff passed: CC read a temporary README and reported `MAPLE`; the bound Codex turn called `get_task`, checked the acceptance condition, called `complete_task` and `ack_handoff`, and left a saved Codex conclusion. The task became `completed` and its handoff event became `handled`. `codex1cc watch` waited for program events and exited with the final record. An initial run exposed App Server MCP approval handling; after a task-scoped approval fix, a new event completed without redelivering the uncertain old one.
+- Real structured-question handoff, managed daemon restart during an active turn, original-window display, real busy-session behavior, Linux outside this environment, macOS and native Windows remain unverified or unsupported as detailed in [host compatibility](handoff-compatibility.md). Automatic handoff is experimental, not a completed cross-platform v1 gate.

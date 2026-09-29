@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex1cc"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local, persistent Claude Code task executor for Codex"
 requires-python = ">=3.10"
-dependencies = ["mcp==1.26.0"]
+dependencies = ["mcp==1.26.0", "websockets>=13,<17"]
 readme = "README.md"
 license = "MIT"
 classifiers = [
@@ -23,3 +23,9 @@ codex1cc = "codex1cc.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+codex1cc = [
+  "bundled_skills/codex1cc-ops/SKILL.md",
+  "bundled_skills/codex1cc-ops/agents/openai.yaml",
+]
