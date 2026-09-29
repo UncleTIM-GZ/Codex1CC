@@ -12,6 +12,31 @@ Licensed under MIT; see [LICENSE](LICENSE).
 
 Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), and [PRD v1.3](Codex1CC%20产品需求文档.md). Manual use remains available.
 
+## How the pieces fit together
+
+```mermaid
+flowchart TD
+    U[User] --> C[Codex conversation]
+    S[codex1cc-ops skill<br/>operating instructions] -. guides .-> C
+    C --> M[Codex1CC MCP tools]
+    M --> E[Task executor]
+    CLI[codex1cc CLI<br/>doctor / bind / watch] --> E
+    CFG[Project authorization config<br/>paths / budgets / binding] --> E
+    E <--> DB[(Tasks / events / handoff records)]
+    E --> MODE{Task permission}
+    MODE -->|read only| SNAP[Authorized path snapshot]
+    SNAP --> BOX[Linux isolated runner]
+    MODE -->|write explicitly enabled| WT[Separate Git worktree]
+    BOX --> CC[Claude Code]
+    WT --> CC
+    CC -->|result / question / failure| E
+    E -->|automatic event| H[Codex App Server handoff host]
+    H --> D[Dedicated Codex session]
+    D -->|check / answer / continue / review / receipt| M
+```
+
+Codex submits one complete task through MCP. The executor checks project authorization and budget, then uses either a read-only snapshot or a write-enabled worktree. CC results and events are saved with the task. In manual mode, ask Codex to check and review them later. In automatic mode, a result, question, or failure wakes the bound dedicated Codex session, which handles the event and saves its conclusion. `codex1cc watch TASK_ID` waits for program events without repeated model calls. Write task commits remain on their separate branch; review does not merge or push them.
+
 ## Requirements
 
 - Python 3.10 or newer, a Codex client that supports local stdio MCP, and Claude Code CLI.
@@ -68,6 +93,25 @@ Register the MCP server explicitly in Codex after reviewing the command:
 Find that absolute executable path with command -v codex1cc. Use the path in the registration so a Codex client launched with a different PATH can still start the server.
 
 Codex should submit one cohesive task with objective, task-specific context, acceptance checks, deliverables, path scope, time and budget limits, and a request ID. On the next natural interaction, call list_tasks, then get_task for the task needing an answer or review. Only complete_task after checking the actual result.
+
+### Use the `$codex1cc-ops` skill
+
+`codex1cc install-skill` installs the bundled [skill instructions](src/codex1cc/bundled_skills/codex1cc-ops/SKILL.md) in `~/.agents/skills/codex1cc-ops/` for the current user. The skill guides **Codex**; it is not a standalone shell command. After installing the skill and registering MCP, restart or refresh Codex and include `$codex1cc-ops` in a chat request. Codex then checks the project, calls the relevant tools, and reports the result. It changes task or binding state only when you request an operation.
+
+Authorize the project in the configuration above first; the skill does not grant new project access. Replace `demo` below with your project ID. You may omit the ID when the current directory matches exactly one configured project; otherwise, name it explicitly.
+
+| Goal | Prompt to give Codex |
+|---|---|
+| Check connectivity | `Use $codex1cc-ops to check demo's executor, MCP registration, and automatic handoff connection. Diagnose only; do not submit a task.` |
+| Bind automatic handoff | `Use $codex1cc-ops to create a dedicated automatic handoff binding for demo and verify it is connected.` |
+| Submit read-only work | `Use $codex1cc-ops to ask CC to check demo's README and docs against the code. Cite file evidence for incorrect claims. Read only; submit once and give me the task ID.` |
+| Submit coding work | `Use $codex1cc-ops to ask CC to fix <specific issue> in demo. Change only src and tests, run <acceptance command>, and deliver the diff, test result, and local commit. Use automatic handoff.` |
+| Check progress once | `Use $codex1cc-ops to summarize the latest activity and blockers for demo's current task. Check once; do not poll.` |
+| Answer or review | `Use $codex1cc-ops to inspect demo's tasks waiting for an answer or review. Check the original request and evidence; ask me about decisions only I can make.` |
+| Rebind | `Use $codex1cc-ops to update demo's automatic handoff binding. Check active tasks and unresolved events before rebinding.` |
+| Unbind | `Use $codex1cc-ops to unbind demo and report how many pending events were disabled. Do not cancel CC tasks.` |
+
+Coding tasks require `write_backend` to be explicitly enabled and the task scope to fit within `write_paths`; the skill never enables project write access merely because a prompt asks for edits. A new task worktree starts at the configured project's committed `HEAD`, so check its base before assigning work that depends on another branch. Automatic handoff requires a connected binding; manual tasks do not. If Codex cannot find the skill, confirm `codex1cc install-skill` succeeded and restart or refresh Codex. If the MCP tools are missing, check `codex mcp list`. After a Codex1CC upgrade, run `codex1cc install-skill --force` to refresh the bundled skill.
 
 ## Optional automatic handoff (experimental)
 

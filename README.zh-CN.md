@@ -10,6 +10,31 @@ Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 
 
 自动接管按 [PRD v1.3](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试和一次真实 CC → Codex 自动验收已通过。宿主运行中重启恢复、真实问题交接及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
 
+## 项目逻辑图
+
+```mermaid
+flowchart TD
+    U[用户] --> C[Codex 对话]
+    S[codex1cc-ops Skill<br/>操作指引] -. 指导 .-> C
+    C --> M[Codex1CC MCP 工具]
+    M --> E[任务执行器]
+    CLI[codex1cc 命令行<br/>doctor / bind / watch] --> E
+    CFG[项目授权配置<br/>路径 / 预算 / 绑定] --> E
+    E <--> DB[(任务 / 事件 / 接管记录)]
+    E --> MODE{任务权限}
+    MODE -->|只读| SNAP[授权路径快照]
+    SNAP --> BOX[Linux 隔离运行]
+    MODE -->|显式启用写入| WT[独立 Git worktree]
+    BOX --> CC[Claude Code]
+    WT --> CC
+    CC -->|结果 / 问题 / 失败| E
+    E -->|自动模式事件| H[Codex App Server 接管宿主]
+    H --> D[专用 Codex 会话]
+    D -->|核对 / 回答 / 续接 / 验收 / 回执| M
+```
+
+Codex 通过 MCP 提交一项完整任务；执行器先检查项目授权和预算，再选择只读快照或写入 worktree。CC 的运行结果和事件保存在任务记录中。手动模式由你稍后让 Codex 查询、验收；自动模式在结果、问题或异常出现时唤起已绑定的专用 Codex 会话处理，并保存结论。`codex1cc watch TASK_ID` 等待程序事件，不反复调用模型。写入任务的提交留在独立分支，验收本身不会合并或推送。
+
 ## 1. 安装前准备
 
 - Python 3.10+；推荐使用较新的 `uv` 或 `pipx` 安装隔离的 Python 工具环境。
@@ -89,6 +114,25 @@ codex mcp list
 ```
 
 下面的操作示例使用 `demo` 项目；克隆 Codex1CC 仓库**不会自动授权任何项目**。首次配置后，可用 `codex1cc doctor` 检查运行条件；首次真实任务还需检查模型认证是否有效。
+
+### 用 `$codex1cc-ops` Skill 操作
+
+`codex1cc install-skill` 将随项目发布的 [Skill 指令](src/codex1cc/bundled_skills/codex1cc-ops/SKILL.md)安装到当前用户的 `~/.agents/skills/codex1cc-ops/`。它是给 **Codex** 的操作指引，不是独立运行的 shell 命令。安装 Skill 和注册 MCP 后，重新打开 Codex，在对话中写出 `$codex1cc-ops` 和你的要求。Skill 会让 Codex 实际检查项目、调用工具，并汇报结果；你无需手填 MCP 参数。只有明确要求操作时才会改变任务或绑定状态。
+
+先按本节上方的配置示例授权项目；Skill 不会替你授予新项目的读写权限。下面把 `demo` 换成你的项目 ID。若当前目录恰好只匹配一个已授权项目，也可省略 ID；多个项目或无法匹配时，请写明 ID。
+
+| 目的 | 可直接发给 Codex 的话 |
+|---|---|
+| 检查连接 | `使用 $codex1cc-ops 检查 demo 的运行条件、MCP 和自动接管连接；只诊断，不派任务。` |
+| 绑定自动接管 | `使用 $codex1cc-ops 为 demo 创建专用自动接管绑定，并确认连接成功。` |
+| 派只读任务 | `使用 $codex1cc-ops 把 demo 的 README 和 docs 交给 CC 核对：列出与代码不符的说明，附文件证据；只读，一次提交，交回任务 ID。` |
+| 派编码任务 | `使用 $codex1cc-ops 让 CC 修复 demo 的具体问题：〈目标〉；只改 src 和 tests，运行〈验收命令〉，交付 diff、测试结果和本地提交；使用自动接管。` |
+| 看一次进度 | `使用 $codex1cc-ops 查看 demo 当前任务最近的活动和卡点；只查一次，不轮询。` |
+| 回答或验收 | `使用 $codex1cc-ops 查看 demo 待回答或待验收的任务，核对原要求与证据；需要我决定的事项先告诉我。` |
+| 更新绑定 | `使用 $codex1cc-ops 更新 demo 的自动接管绑定；先核对活跃任务和未处理事件，再重绑。` |
+| 解绑 | `使用 $codex1cc-ops 解绑 demo，报告停用了多少待处理事件；不要取消 CC 任务。` |
+
+编码任务要求项目已显式启用 `write_backend`，任务范围必须落在 `write_paths` 内；Skill 不会因为一句“让 CC 改代码”而自行开启项目写入权限。新任务从项目根目录当前已提交的 `HEAD` 建 worktree，依赖其他分支上的工作时，先让 Codex 核对基线。自动接管还要求项目绑定成功；手动任务无需绑定。若 Codex 看不到 Skill，先确认 `codex1cc install-skill` 已成功，再重启或刷新 Codex；若看不到工具，检查 `codex mcp list`。升级工具后用 `codex1cc install-skill --force` 更新随包发布的 Skill。
 
 ### 开启自动接管（实验性）
 
