@@ -100,7 +100,7 @@ class _Connection:
         self.reader_task = asyncio.create_task(self._read())
         try:
             await self.request("initialize", {
-                "clientInfo": {"name": "codex1cc", "title": "Codex1CC", "version": "0.2.0"},
+                "clientInfo": {"name": "codex1cc", "title": "Codex1CC", "version": "0.3.0"},
                 "capabilities": {"experimentalApi": True},
             }, timeout=5)
             await self.send({"method": "initialized", "params": {}})

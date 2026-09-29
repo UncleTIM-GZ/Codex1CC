@@ -22,6 +22,18 @@ Before a lifecycle operation, confirm that `codex1cc` is installed. Use
 `codex1cc doctor` for executor and binding health. Use `codex mcp get codex1cc`
 only when the MCP registration itself is in doubt.
 
+Read-only tasks use `actions=["read"]`. For a coding or test task, first check
+that the project explicitly enables `write_backend` and that the user's stated
+scope is within its `write_paths`. Explain once that this mode lets CC run
+commands in a trusted project and does not enforce a filesystem or network
+sandbox. Use `actions=["read","write","execute"]`; do not submit it as a
+read-only task. A task worktree starts from the project's committed HEAD, so
+check that this HEAD contains any prior branch or worktree the task depends on;
+if it does not, report the baseline mismatch before submission. Report when
+the source workspace has uncommitted changes. Never enable the
+write backend in project configuration merely because a task asked to edit;
+the user must explicitly authorize that project-level trust choice.
+
 ## Bind automatic handoff
 
 Prefer a dedicated managed Codex thread:
@@ -71,7 +83,9 @@ independent and the configured projects allow parallel execution.
 Call `submit_task` once with a new stable `request_id`. Reuse that same ID only
 to retry an uncertain identical request. Set `handoff="automatic"` when the
 user requested automatic takeover. Return the task ID and reported handoff
-status, then stop; do not schedule `list_tasks` or `get_task` polling.
+status, then stop; do not schedule `list_tasks` or `get_task` polling. For a
+write task, include its task branch and worktree, and note whether source
+uncommitted changes were excluded.
 
 ## Handle delivered events
 
@@ -82,9 +96,15 @@ When Codex1CC delivers a question, result, failure, or interruption:
 2. Answer only when the existing evidence determines the answer. Ask the user
    when the event needs a product choice, new permission, broader scope, or
    additional budget.
-3. Review evidence before `complete_task`. Use `continue_task` only for a
+3. For write tasks, inspect the actual branch diff, commits, dirty files,
+   outside-scope report, and test evidence. Treat CC's claims as unverified.
+   Review evidence before `complete_task`. Use `continue_task` only for a
    concrete gap inside the original authorization. Never automatically retry a
-   failed or interrupted task.
+   failed or interrupted task. A failed write task may contain valid work:
+   after checking the diff, commits, and acceptance evidence, `complete_task`
+   may explicitly accept it while retaining the original failure reason.
+   Keep the worktree until the user explicitly
+   requests cleanup; do not merge, push, or deploy on task completion alone.
 4. Call `ack_handoff` with the delivered `event_id`, `receipt_token`, and the
    outcome that matches the action: `completed`, `answered`, `continued`,
    `needs_user`, `reviewed`, or `failed`.

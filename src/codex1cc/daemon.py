@@ -19,6 +19,8 @@ from .auth import provider_environment
 from .policy import project_config, snapshot
 from .sandbox import linux_available, wrap_linux
 from .store import Store, scrub
+from .workspace import (artifacts, create_worktree, discard_unstarted, project_ready,
+                        validate_write_scope, verify_worktree)
 
 ACTIONABLE = {"waiting_answer", "review_required", "failed", "interrupted"}
 KNOWN = ACTIONABLE | {"queued", "running", "continuing", "completed", "canceled"}
@@ -381,8 +383,11 @@ class Executor:
         bundle = item.get("bundle")
         result["request"] = ({key: scrub(bundle.get(key)) for key in (
             "objective", "context", "acceptance", "deliverables", "scope",
-            "limits", "question_policy")}) if isinstance(bundle, dict) else None
+            "limits", "question_policy", "actions")}) if isinstance(bundle, dict) else None
         result["handoff_mode"] = bundle.get("handoff", {}).get("mode", "manual") if isinstance(bundle, dict) else "manual"
+        result["backend"] = bundle.get("backend", "read_only") if isinstance(bundle, dict) else None
+        if isinstance(bundle, dict) and bundle.get("workspace"):
+            result["workspace"] = bundle["workspace"]
         return result
 
     async def submit(self, params: dict) -> dict:
@@ -410,8 +415,14 @@ class Executor:
             raise BridgeError("INVALID_ARGUMENT", "Invalid context or question_policy")
         if not isinstance(scope, list) or not scope or any(not isinstance(x, str) for x in scope):
             raise BridgeError("INVALID_ARGUMENT", "scope must list authorized paths")
-        if actions != ["read"]:
-            raise BridgeError("SANDBOX_UNAVAILABLE", "Only read-only tasks are currently supported")
+        write_task = actions == ["read", "write", "execute"]
+        if actions != ["read"] and not write_task:
+            raise BridgeError("SANDBOX_UNAVAILABLE", "Only read or explicitly enabled read/write/execute tasks are supported")
+        if write_task:
+            if not project["write_backend"].get("enabled"):
+                raise BridgeError("SANDBOX_UNAVAILABLE", "Native write backend is not enabled for this project")
+            scope = validate_write_scope(project["write_backend"]["write_paths"], scope)
+            project_ready(project)
         if not isinstance(limits, dict):
             raise BridgeError("INVALID_ARGUMENT", "limits must be an object")
         configured_max = self._number(project.get("limits", {}).get("seconds", 3600), 1, 3600)
@@ -441,12 +452,22 @@ class Executor:
             if self.store.busy(project_id):
                 raise BridgeError("PROJECT_BUSY", "Another task is active in this project")
         task_id = uuid.uuid4().hex
-        snapshot_parent = STATE / "snapshots"
-        private_dir(snapshot_parent)
-        snapshot_path = snapshot_parent / task_id
-        digest, snapshot_info = snapshot(project, scope, snapshot_path)
+        workspace = None
+        if write_task:
+            workspace = create_worktree(project["root"], task_id, project["shared_context"])
+            snapshot_path = Path(workspace["worktree_path"])
+            digest = workspace["shared_context_sha256"]
+            snapshot_info = {"base_commit": workspace["base_commit"],
+                             "source_dirty": workspace["source_dirty"]}
+        else:
+            snapshot_parent = STATE / "snapshots"
+            private_dir(snapshot_parent)
+            snapshot_path = snapshot_parent / task_id
+            digest, snapshot_info = snapshot(project, scope, snapshot_path)
         bundle = {"objective": objective, "acceptance": acceptance, "deliverables": deliverables,
                   "context": context, "scope": scope, "actions": actions,
+                  "task_id": task_id,
+                  "backend": "native_write" if write_task else "read_only", "workspace": workspace,
                   "limits": {"seconds": max_seconds, "usd": float(budget), "rounds": max_rounds},
                   "question_policy": question_policy,
                   "shared_context": project["shared_context"], "snapshot_sha256": digest,
@@ -454,16 +475,23 @@ class Executor:
         try:
             self.store.create(task_id, project_id, request_id, bundle, project, str(snapshot_path))
         except sqlite3.IntegrityError as exc:
-            shutil.rmtree(snapshot_path, ignore_errors=True)
+            if workspace:
+                discard_unstarted(project["root"], workspace, task_id)
+            else:
+                shutil.rmtree(snapshot_path, ignore_errors=True)
             recovered = self.store.operation(request_id, "submit_task")
             if recovered:
                 return recovered
             raise BridgeError("PROJECT_BUSY", "Another task is active in this project") from exc
         except Exception:
-            shutil.rmtree(snapshot_path, ignore_errors=True)
+            if workspace:
+                discard_unstarted(project["root"], workspace, task_id)
+            else:
+                shutil.rmtree(snapshot_path, ignore_errors=True)
             raise
         self.store.event(task_id, "queued", {"scope": scope, "snapshot_sha256": digest})
-        result = {"task_id": task_id, "status": "queued",
+        result = {"task_id": task_id, "status": "queued", "backend": bundle["backend"],
+                  "workspace": workspace,
                   "handoff": {"mode": binding["mode"],
                               "status": "connected" if binding["mode"] == "automatic" else "disabled"}}
         self.store.save_operation(request_id, "submit_task", result)
@@ -475,8 +503,16 @@ class Executor:
         if existing:
             return existing
         item = self.store.one(safe_id(params.get("task_id"), "task_id"))
-        if item["status"] != "review_required" or not item["session_id"]:
+        resumable = item["status"] == "review_required" or (
+            item["status"] == "interrupted" and item["bundle"].get("backend") == "native_write"
+            and item["exit_reason"] == "daemon_restart")
+        if not resumable or not item["session_id"]:
             raise BridgeError("INVALID_STATE", "Task cannot be resumed")
+        if item["bundle"].get("backend") == "native_write":
+            verify_worktree(item["project"]["root"], item["bundle"]["workspace"])
+            if item["status"] == "interrupted" and not isinstance(
+                    (item["usage"] or {}).get("total_cost_usd"), (int, float)):
+                raise BridgeError("LIMIT_REACHED", "Interrupted round cost is unknown; inspect worktree before a new task")
         if item["round_no"] >= item["bundle"]["limits"]["rounds"]:
             raise BridgeError("LIMIT_REACHED", "Task round limit reached")
         if item["usage"]:
@@ -501,9 +537,13 @@ class Executor:
         if existing:
             return existing
         item = self.store.one(safe_id(params.get("task_id"), "task_id"))
-        if item["status"] != "review_required":
-            raise BridgeError("INVALID_STATE", "Only reviewed tasks can be completed")
+        failed_write = (item["status"] == "failed" and
+                        (item.get("bundle") or {}).get("backend") == "native_write")
+        if item["status"] != "review_required" and not failed_write:
+            raise BridgeError("INVALID_STATE", "Only reviewed tasks or inspected failed write tasks can be completed")
         note = self._text(params.get("review_note"), "review_note")
+        if failed_write:
+            verify_worktree(item["project"]["root"], item["bundle"]["workspace"])
         self.store.transition(item["id"], "completed", {"review_note": note},
                               status="completed", review_note=note,
                               complete_request_id=request_id)
@@ -571,9 +611,18 @@ class Executor:
         item = self.store.one(safe_id(params.get("task_id"), "task_id"))
         if item["status"] not in {"queued", "running", "waiting_answer", "continuing"}:
             raise BridgeError("INVALID_STATE", "Task is not active")
-        self.store.transition(item["id"], "canceled", {}, status="canceled", exit_reason="user_cancel",
-                              cancel_request_id=request_id)
+        self.store.transition(item["id"], "canceled", {}, status="canceled",
+                              exit_reason="user_cancel", cancel_request_id=request_id)
         await self._stop_process(item["id"])
+        if (item.get("bundle") or {}).get("backend") == "native_write":
+            try:
+                workspace = artifacts(item["project"]["root"], item["bundle"]["workspace"],
+                                      item["bundle"]["scope"])
+            except BridgeError:
+                workspace = item["bundle"]["workspace"]
+            self.store.update(item["id"], result_json=json.dumps(scrub({"workspace": workspace}),
+                                                            ensure_ascii=False))
+            self.store.event(item["id"], "workspace_preserved", {"workspace": workspace})
         result = {"task_id": item["id"], "status": "canceled", "snapshot_path": item["snapshot_path"]}
         self.store.save_operation(request_id, "cancel_task", result)
         return result
@@ -594,6 +643,7 @@ class Executor:
     async def run_task(self, task_id: str, instruction: str | None = None) -> None:
         item = self.store.one(task_id)
         bundle, project = item["bundle"], item["project"]
+        write_task = bundle.get("backend") == "native_write"
         if item["status"] == "canceled":
             self.jobs.pop(task_id, None)
             return
@@ -616,20 +666,28 @@ class Executor:
         if remaining_budget <= 0:
             self._fail(task_id, "LIMIT_REACHED", "Task budget reached")
             return
-        command = [cli, "-p", "--output-format", "stream-json", "--verbose", "--restricted",
-                   "--permission-mode", "dontAsk",
-                   "--strict-mcp-config", "--mcp-config", str(mcp_config),
-                   "--allowedTools", "Read", "Glob", "Grep", "mcp__codex1cc_questions__ask_codex",
-                   "--tools", "Read,Glob,Grep", "--max-budget-usd", str(remaining_budget)]
+        command = [cli, "-p", "--output-format", "stream-json", "--verbose"]
+        if write_task:
+            command += ["--permission-mode", "bypassPermissions", "--strict-mcp-config",
+                        "--mcp-config", str(mcp_config), "--tools", "Read,Glob,Grep,Edit,Write,Bash",
+                        "--max-budget-usd", str(remaining_budget)]
+        else:
+            command += ["--restricted", "--permission-mode", "dontAsk",
+                        "--strict-mcp-config", "--mcp-config", str(mcp_config),
+                        "--allowedTools", "Read", "Glob", "Grep", "mcp__codex1cc_questions__ask_codex",
+                        "--tools", "Read,Glob,Grep", "--max-budget-usd", str(remaining_budget)]
         if project.get("model"):
             command += ["--model", project["model"]]
         if item["session_id"]:
             command += ["--resume", item["session_id"]]
         command.append(prompt)
-        env = {key: value for key, value in os.environ.items() if
-               key in {"PATH", "HOME", "LANG", "LC_ALL", "PYTHONPATH", "CODEX1CC_STATE_DIR",
-                       "CLAUDE_CONFIG_DIR",
-                       "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"}}
+        allowed_env = {"PATH", "HOME", "LANG", "LC_ALL", "PYTHONPATH", "CODEX1CC_STATE_DIR",
+                       "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+                       "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"}
+        if write_task:
+            allowed_env |= {"XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "DISPLAY",
+                            "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"}
+        env = {key: value for key, value in os.environ.items() if key in allowed_env}
         try:
             env.update(provider_environment())
         except BridgeError as exc:
@@ -641,7 +699,10 @@ class Executor:
             env["CLAUDE_CONFIG_DIR"] = str(Path(env["CLAUDE_CONFIG_DIR"]).expanduser().resolve())
         try:
             command[0] = str(Path(cli).resolve(strict=True))
-            command = wrap_linux(cli, command, Path(item["snapshot_path"]), mcp_config)
+            if write_task:
+                verify_worktree(project["root"], bundle["workspace"])
+            else:
+                command = wrap_linux(cli, command, Path(item["snapshot_path"]), mcp_config)
         except BridgeError as exc:
             self._fail(task_id, exc.code, str(exc))
             return
@@ -710,6 +771,12 @@ class Executor:
                 self._fail(task_id, "CLI_FAILED", stderr or last_error or "Claude did not return a successful result")
                 return
             summary = self._summary(result)
+            if write_task:
+                try:
+                    summary["workspace"] = artifacts(project["root"], bundle["workspace"], bundle["scope"])
+                except BridgeError as exc:
+                    self._fail(task_id, exc.code, str(exc))
+                    return
             round_cost = result.get("total_cost_usd")
             total_cost = prior_cost + round_cost if isinstance(round_cost, (int, float)) else None
             usage = {"total_cost_usd": total_cost, "last_round": result.get("usage")}
@@ -728,6 +795,19 @@ class Executor:
 
     @staticmethod
     def _prompt(bundle: dict) -> str:
+        if bundle.get("backend") == "native_write":
+            return (
+                f"Codex1CC 任务 {bundle.get('task_id', '')}。目标：{bundle['objective']}\n"
+                f"任务上下文：{bundle['context']}\n"
+                f"固定共享信息文件：{bundle['workspace']['shared_context_snapshot']}\n"
+                f"声明的改动范围：{json.dumps(bundle['scope'], ensure_ascii=False)}。"
+                "仅在独立任务分支中工作；可运行测试和创建本地提交。"
+                "不要推送、合并、部署或清理其他工作树。"
+                f"验收标准：{json.dumps(bundle['acceptance'], ensure_ascii=False)}\n"
+                f"交付物：{json.dumps(bundle['deliverables'], ensure_ascii=False)}\n"
+                f"提问规则：{bundle['question_policy']}\n"
+                "最终交付简短结论、逐项验收结果、提交与测试证据及未解决阻塞。"
+            )
         return (
             f"目标：{bundle['objective']}\n任务上下文：{bundle['context']}\n"
             f"共享文件：{bundle['shared_context']}\n验收标准：{json.dumps(bundle['acceptance'], ensure_ascii=False)}\n"
@@ -757,20 +837,47 @@ class Executor:
 
     def _fail(self, task_id: str, code: str, message: str) -> None:
         self.jobs.pop(task_id, None)
-        if self.store.one(task_id)["status"] in {"canceled", "review_required", "completed"}:
+        item = self.store.one(task_id)
+        if item["status"] in {"canceled", "review_required", "completed"}:
             return
         safe_message = scrub(message[:2000])
-        self.store.transition(task_id, "failed", {"code": code, "message": safe_message},
+        summary = {"conclusion": safe_message}
+        bundle = item.get("bundle") or {}
+        if bundle.get("backend") == "native_write":
+            try:
+                summary["workspace"] = artifacts(item["project"]["root"],
+                                                  bundle["workspace"], bundle["scope"])
+            except BridgeError:
+                summary["workspace"] = bundle["workspace"]
+        self.store.transition(task_id, "failed", {"code": code, "message": safe_message,
+                                                   "workspace": summary.get("workspace")},
                               status="failed", exit_reason=code,
-                              result_json=json.dumps({"conclusion": safe_message}))
+                              result_json=json.dumps(scrub(summary), ensure_ascii=False))
         self.handoff_changed.set()
 
     def doctor(self) -> dict:
         ready, reason = linux_available()
+        write_projects = {}
+        try:
+            for project_id in projects():
+                try:
+                    project = project_config(project_id)
+                    if project["write_backend"].get("enabled"):
+                        project_ready(project)
+                        write_projects[project_id] = {"enabled": True, "ready": True}
+                    else:
+                        write_projects[project_id] = {"enabled": False, "ready": False}
+                except BridgeError as exc:
+                    write_projects[project_id] = {"enabled": True, "ready": False,
+                                                  "reason": exc.code}
+        except BridgeError:
+            pass
         return {"protocol_version": 2, "platform": sys.platform, "claude_path": shutil.which("claude"),
                 "config_path": str(__import__("codex1cc.common", fromlist=["CONFIG"]).CONFIG),
                 "state_path": str(STATE), "sandbox_ready": ready, "reason": reason,
-                "mode": "read_only" if ready else "disabled"}
+                "mode": "read_only" if ready else "disabled",
+                "native_write": {"available": bool(shutil.which("git") and shutil.which("claude")),
+                                 "trust_required": True, "projects": write_projects}}
 
 
 async def serve() -> None:

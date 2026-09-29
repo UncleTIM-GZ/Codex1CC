@@ -53,6 +53,15 @@ def project_config(project_id: str) -> dict:
         raise BridgeError("INVALID_CONFIG", "shared_context must name a project-relative file")
     for path in [*paths, shared]:
         validate_relative(path)
+    write_backend = config.get("write_backend", {"enabled": False})
+    if not isinstance(write_backend, dict) or type(write_backend.get("enabled", False)) is not bool:
+        raise BridgeError("INVALID_CONFIG", "write_backend.enabled must be boolean")
+    if any(key not in {"enabled", "write_paths"} for key in write_backend):
+        raise BridgeError("INVALID_CONFIG", "Unknown write_backend setting")
+    if write_backend.get("enabled"):
+        from .workspace import validate_write_scope
+        write_paths = write_backend.get("write_paths")
+        validate_write_scope(write_paths, write_paths)
     model = config.get("model")
     if model is not None and (not isinstance(model, str) or not model.strip() or len(model) > 100):
         raise BridgeError("INVALID_CONFIG", "model must be a nonempty model ID")
@@ -77,7 +86,7 @@ def project_config(project_id: str) -> dict:
             raise BridgeError("INVALID_CONFIG", "handoff.turn_seconds must be 30 through 3600")
     return {"root": str(root), "read_paths": paths, "shared_context": shared,
             "limits": limits, "claude_path": config.get("claude_path"),
-            "model": model, "handoff": handoff}
+            "model": model, "handoff": handoff, "write_backend": write_backend}
 
 
 def validate_relative(value: str) -> Path:

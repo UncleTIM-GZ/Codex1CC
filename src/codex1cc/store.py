@@ -417,6 +417,8 @@ class Store:
             bundle = json.loads(task["bundle_json"] or "{}")
             mode = bundle.get("handoff", {}).get("mode", "manual")
             return {"task_id": task["id"], "status": task["status"],
+                    "backend": bundle.get("backend", "read_only"),
+                    "workspace": bundle.get("workspace"),
                     "handoff": {"mode": mode, "status": "connected" if mode == "automatic" else "disabled"}}
         question = self.db.execute("SELECT id,task_id FROM questions WHERE request_id=?",
                                    (request_id,)).fetchone()
@@ -446,18 +448,26 @@ class Store:
         self.db.commit()
 
     def mark_interrupted(self) -> None:
-        rows = self.db.execute("SELECT id,process_id FROM tasks WHERE status IN ('running','waiting_answer','continuing')").fetchall()
+        rows = self.db.execute("SELECT id,process_id,bundle_json FROM tasks WHERE status IN ('running','waiting_answer','continuing')").fetchall()
         for row in rows:
             pid = row["process_id"]
+            bundle = json.loads(row["bundle_json"] or "{}")
+            workspace = bundle.get("workspace") or {}
+            reason = "daemon_restart"
             if pid and os.name == "posix" and Path(f"/proc/{pid}/cmdline").exists():
                 try:
                     command = Path(f"/proc/{pid}/cmdline").read_bytes()
-                    if row["id"].encode() in command:
+                    cwd = Path(f"/proc/{pid}/cwd").resolve()
+                    if (row["id"].encode() in command or
+                            (workspace and cwd == Path(workspace["worktree_path"]).resolve()
+                             and b"claude" in command)):
                         os.killpg(pid, signal.SIGTERM)
+                    else:
+                        reason = "daemon_restart_unverified_process"
                 except (OSError, ProcessLookupError):
-                    pass
-            self.transition(row["id"], "interrupted", {"reason": "daemon_restart", "review_required": True},
-                            status="interrupted", exit_reason="daemon_restart", process_id=None)
+                    reason = "daemon_restart_unverified_process"
+            self.transition(row["id"], "interrupted", {"reason": reason, "review_required": True},
+                            status="interrupted", exit_reason=reason, process_id=None)
         self.db.execute("UPDATE questions SET status='expired' WHERE status='pending'")
         self.db.commit()
 
@@ -473,12 +483,15 @@ class Store:
         """Remove old task content; keep minimal IDs and terminal statuses."""
         cutoff = time.time() - retention_days * 86400
         rows = self.db.execute(
-            "SELECT id,snapshot_path FROM tasks WHERE status IN ('completed','failed','canceled') "
+            "SELECT id,snapshot_path,bundle_json FROM tasks WHERE status IN ('completed','failed','canceled') "
             "AND updated_at<? AND bundle_json IS NOT NULL "
             "AND NOT EXISTS (SELECT 1 FROM handoff_events h WHERE h.task_id=tasks.id "
             "AND h.status!='handled')", (cutoff,)).fetchall()
         snapshots = (STATE / "snapshots").resolve()
+        pruned = 0
         for row in rows:
+            if json.loads(row["bundle_json"] or "{}").get("backend") == "native_write":
+                continue  # Worktrees and branch provenance require explicit user cleanup.
             path_text = row["snapshot_path"]
             if path_text:
                 path = Path(path_text)
@@ -496,4 +509,5 @@ class Store:
                     "UPDATE tasks SET prompt='[expired]',acceptance='[expired]',bundle_json=NULL,"
                     "project_json=NULL,result_json=NULL,snapshot_path=NULL,review_note=NULL,"
                     "usage_json=NULL WHERE id=?", (row["id"],))
-        return len(rows)
+            pruned += 1
+        return pruned

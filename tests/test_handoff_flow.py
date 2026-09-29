@@ -119,6 +119,53 @@ class HandoffFlowTest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_native_write_result_reaches_bound_codex(self) -> None:
+        config_path = Path(self.env["CODEX1CC_CONFIG"])
+        config = json.loads(config_path.read_text())
+        root = Path(config["projects"]["sample"]["root"])
+        for command in (["init", "-q"], ["config", "user.name", "Test User"],
+                        ["config", "user.email", "test@example.invalid"], ["add", "."],
+                        ["commit", "-qm", "baseline"]):
+            subprocess.run(["git", "-C", str(root), *command], check=True)
+        config["projects"]["sample"]["write_backend"] = {
+            "enabled": True, "write_paths": ["README.txt"]}
+        config_path.write_text(json.dumps(config))
+        config_path.chmod(0o600)
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, subprocess, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('README.txt').write_text('edited')\n"
+            "subprocess.run(['git','add','README.txt'],check=True)\n"
+            "subprocess.run(['git','commit','-qm','edit'],check=True)\n"
+            "print(json.dumps({'type':'result','session_id':'write-session',"
+            "'result':'Edited','is_error':False,'total_cost_usd':0.001}),flush=True)\n",
+            encoding="utf-8")
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit README", "context": "",
+            "acceptance": ["README edited"], "deliverables": ["Local commit"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex, "handoff": "automatic"})
+        self.assertTrue(started["ok"], started)
+        task_id = started["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            report = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            latest = report["handoff"]["latest"]
+            if report["status"] == "review_required" and latest and latest["status"] == "accepted":
+                break
+            time.sleep(0.02)
+        self.assertEqual(report["status"], "review_required", report)
+        self.assertEqual(len(report["result"]["workspace"]["commits"]), 1)
+        completed = self.call("complete_task", {"task_id": task_id,
+            "review_note": "Checked branch commit and README", "request_id": uuid.uuid4().hex})
+        self.assertEqual(completed["data"]["status"], "completed")
+        ack = self.call("ack_handoff", {"event_id": latest["id"],
+            "receipt_token": self.receipt(latest["id"]), "outcome": "completed"})
+        self.assertEqual(ack["data"]["status"], "handled")
+        self.assertEqual(len((self.state / "delivered.jsonl").read_text().splitlines()), 1)
+
     def test_automatic_requires_registered_binding(self) -> None:
         config_path = Path(self.env["CODEX1CC_CONFIG"])
         config = json.loads(config_path.read_text())

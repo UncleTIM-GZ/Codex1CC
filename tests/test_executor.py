@@ -127,6 +127,121 @@ class ExecutorTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "SANDBOX_UNAVAILABLE")
 
+    def test_native_write_requires_project_opt_in(self) -> None:
+        result = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit a file",
+            "acceptance": ["done"], "deliverables": ["result"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "SANDBOX_UNAVAILABLE")
+
+    def _enable_write_backend(self, paths: list[str]) -> None:
+        for command in (["init", "-q"], ["config", "user.name", "Test User"],
+                        ["config", "user.email", "test@example.invalid"], ["add", "."],
+                        ["commit", "-qm", "baseline"]):
+            subprocess.run(["git", "-C", str(self.root), *command], check=True)
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["write_backend"] = {
+            "enabled": True, "write_paths": paths}
+        self.config.write_text(json.dumps(config))
+        self.config.chmod(0o600)
+
+    def test_native_write_task_commits_on_isolated_branch(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, subprocess, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('README.txt').write_text('edited by CC')\n"
+            "subprocess.run(['git','add','README.txt'],check=True)\n"
+            "subprocess.run(['git','commit','-qm','implement task'],check=True)\n"
+            "print(json.dumps({'type':'result','session_id':'write-session',"
+            "'result':'Implemented and tested','is_error':False,'total_cost_usd':0.01}),flush=True)\n",
+            encoding="utf-8")
+        health = self.call("doctor", {})
+        self.assertTrue(health["data"]["native_write"]["projects"]["sample"]["ready"])
+        params = {"project_id": "sample", "objective": "Edit README", "context": "",
+                  "acceptance": ["README changed"], "deliverables": ["Local commit"],
+                  "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+                  "request_id": uuid.uuid4().hex}
+        first = self.call("submit_task", params)
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first, self.call("submit_task", params))
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["status"], "review_required", item)
+        workspace = item["result"]["workspace"]
+        self.assertEqual(workspace["changed_paths"], ["README.txt"])
+        self.assertEqual(workspace["outside_scope"], [])
+        self.assertEqual(len(workspace["commits"]), 1)
+        self.assertFalse(workspace["dirty"])
+        self.assertEqual((self.root / "README.txt").read_text(), "public task content")
+        self.assertEqual((Path(workspace["worktree_path"]) / "README.txt").read_text(), "edited by CC")
+
+    def test_native_write_reports_changes_outside_declared_scope(self) -> None:
+        self._enable_write_backend(["README.txt", "PRIVATE.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('PRIVATE.txt').write_text('changed')\n"
+            "print(json.dumps({'type':'result','session_id':'write-session',"
+            "'result':'Done','is_error':False,'total_cost_usd':0.01}),flush=True)\n",
+            encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit README", "context": "",
+            "acceptance": ["README changed"], "deliverables": ["Diff"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": first["data"]["task_id"]})["data"]["task"]
+            if item["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["status"], "review_required", item)
+        self.assertEqual(item["result"]["workspace"]["outside_scope"], ["PRIVATE.txt"])
+
+    def test_native_write_failure_preserves_partial_edit(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('README.txt').write_text('partial change')\n"
+            "sys.exit(3)\n", encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit README", "context": "",
+            "acceptance": ["README changed"], "deliverables": ["Diff"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": first["data"]["task_id"]})["data"]["task"]
+            if item["status"] == "failed":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["status"], "failed", item)
+        workspace = item["result"]["workspace"]
+        self.assertEqual(workspace["changed_paths"], ["README.txt"])
+        self.assertTrue(workspace["dirty"])
+        self.assertEqual((self.root / "README.txt").read_text(), "public task content")
+        reviewed = self.call("complete_task", {"task_id": first["data"]["task_id"],
+                    "review_note": "Inspected retained diff; accepted despite CLI exit error",
+                    "request_id": uuid.uuid4().hex})
+        self.assertEqual(reviewed["data"]["status"], "completed")
+
     def test_symlink_scope_fails_closed(self) -> None:
         (self.root / "linked.txt").symlink_to(self.root / "PRIVATE.txt")
         config = json.loads(self.config.read_text())

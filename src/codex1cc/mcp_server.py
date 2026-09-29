@@ -28,7 +28,7 @@ async def submit_task(project_id: str, objective: str, context: str,
                                      "context": context, "acceptance": acceptance,
                                      "deliverables": deliverables, "scope": scope,
                                      "request_id": request_id, "question_policy": question_policy,
-                                     "limits": limits or {}, "actions": actions or ["read"],
+                                     "limits": limits or {}, "actions": actions if actions is not None else ["read"],
                                      "handoff": handoff})
 
 

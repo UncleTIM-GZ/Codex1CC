@@ -1,22 +1,22 @@
 # Codex1CC
 
-Codex1CC lets you ask Codex to hand a well-defined task to Claude Code and review the result. You describe the task in plain language. Claude Code reads only the project files you authorize and returns its findings. The task record stays on the computer running the tool, so you can close Codex and check the result in a new conversation.
+Codex1CC lets you ask Codex to hand a well-defined task to Claude Code and review the result. Tasks are read-only by default. An explicitly enabled native write backend lets Claude edit, test, and make local commits in a separate Git worktree. Task records persist on the computer running the tool.
 
 Install Codex1CC where it can access your project files and Claude Code. Codex connects to it through MCP, a tool interface; you do not need to run a web service. Optional automatic handoff starts a bound Codex session when CC finishes, asks a question, or fails. Results are saved with the task; the original Codex window may not reopen.
 
-**Status: alpha.** Linux has a read-only bubblewrap runner. A non-sensitive real task, blocking question, session resume, and Codex review passed locally. macOS isolation and broader platform acceptance are still release gates. Editing user projects is disabled. Do not use this as a security boundary for sensitive projects until those gates pass.
+**Status: alpha.** The Linux read-only runner and automatic handoff have each passed a small real task. The native write backend passed fake-CLI tests and one real edit, command check, local commit, and review-required delivery in a temporary project. Real automatic Codex review of a write task and cross-machine acceptance remain open. Write mode runs commands in a trusted project and is not a filesystem or network sandbox.
 
 **中文完整说明：**[安装、项目初始化、指挥 CC、跨会话验收与注意事项](README.zh-CN.md)。
 
 Licensed under MIT; see [LICENSE](LICENSE).
 
-Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), and [PRD v1.2](Codex1CC%20产品需求文档.md). Manual use remains available.
+Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), and [PRD v1.3](Codex1CC%20产品需求文档.md). Manual use remains available.
 
 ## Requirements
 
 - Python 3.10 or newer, a Codex client that supports local stdio MCP, and Claude Code CLI.
 - Linux with bubblewrap for real read-only tasks. WSL uses the Linux path.
-- macOS support is planned in the [PRD](Codex1CC%20产品需求文档.md); real tasks currently fail closed on macOS.
+- macOS read-only isolation is planned in the [PRD](Codex1CC%20产品需求文档.md). Native write behavior on macOS has not been validated.
 - Your own Claude Code authentication and model service. You are responsible for model charges.
 
 ## Install and configure
@@ -45,7 +45,15 @@ Edit the displayed JSON config. Keep it readable only by your user (mode 0600). 
 
 Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. The configured `seconds`, `usd`, and `rounds` are project caps. A task can lower its time and USD caps, while the round cap comes from project configuration.
 
-Create the shared context file inside the target project before submitting a task. Record authoritative document paths, stable constraints, and reusable public facts; exclude credentials and unverified status claims. Claude receives this file as read-only input even if it is not in the requested `scope`. The selected read paths are copied into a private task snapshot; symbolic links and special files are rejected. The project configuration authorizes the maximum scope, and each task selects a subset. Each task path must exactly match one configured `read_paths` entry: if `docs` is allowed, request `docs`, not an unlisted `docs/file.md`. Exclude generated assets and caches; a snapshot is limited to 20 MiB and 2000 files.
+Create the shared context file inside the target project before submitting a task. Record authoritative document paths, stable constraints, and reusable public facts; exclude credentials and unverified status claims. Claude receives a fixed copy even if it is not in the requested `scope`. For read-only tasks, selected paths are copied into a private snapshot; symbolic links and special files are rejected. Each task path must exactly match a configured `read_paths` entry: if `docs` is allowed, request `docs`, not an unlisted `docs/file.md`. Exclude generated assets and caches; a read-only snapshot is limited to 20 MiB and 2000 files.
+
+### Optional native CC editing (experimental)
+
+For a Git repository you trust, add `"write_backend": {"enabled": true, "write_paths": ["src", "tests", "docs"]}` to its project configuration. The root must be the repository top level. Use `["."]` to explicitly allow the full repository. Ask Codex to submit a development task with `actions=["read","write","execute"]`, a narrower `scope`, acceptance checks, and a budget. Codex1CC creates a `codex1cc/<task_id>` branch and a separate worktree from the current `HEAD`; uncommitted changes in the original workspace are not included. CC may make local commits. No merge or push is performed by Codex1CC.
+
+> Use $codex1cc-ops to delegate this complete development task in demo to CC with read, write, and test execution. Limit changed paths to `src` and `tests`, use automatic handoff, and review the actual diff, commits, and test evidence when CC finishes. Submit once; do not poll or retry automatically.
+
+The result includes the worktree, base and final commits, dirty state, and paths changed outside the declared scope. CC's Bash access can reach local files and networks; `write_paths` and `scope` are admission and review rules, not a hard sandbox. Use this only with projects and environments you trust. Canceled and failed tasks preserve their worktree for review. After a CLI failure, Codex may explicitly accept valid work after checking the evidence; the original failure reason stays recorded. Existing Claude background sessions are not adopted.
 
 Run diagnostics:
 
@@ -93,7 +101,7 @@ If a handoff shows `needs_reconcile`, inspect its saved `turn_id`, reason, and C
 
 ## Use Codex to direct Claude Code
 
-Codex submits and reviews one complete task; Claude Code (CC) reads a bounded snapshot and returns findings. Speak to Codex in natural language. Codex uses the `codex1cc` MCP tools. Task state persists locally across Codex conversations. Manual mode requires a later check. Automatic mode starts the registered Codex handoff session on a task event without model polling; it may not reopen your original window.
+Codex submits and reviews one complete task. CC reads a bounded snapshot for read-only work, or edits an isolated Git worktree when native write is enabled. Speak to Codex in natural language. Task state persists across Codex conversations. Manual mode requires a later check. Automatic mode starts the registered Codex handoff session on a task event without model polling; it may not reopen your original window.
 
 ### Start or re-enter an authorized project
 
@@ -150,7 +158,7 @@ Review prompt:
 
 If you no longer need a task, tell Codex to cancel it and give its task number. Recording acceptance does not edit or deploy the project. Follow-up investigation uses the original file snapshot; submit a new task to capture changed project files.
 
-The task content for completed, failed, and canceled tasks is pruned after 30 days when the executor next starts. Pending questions and reviewable tasks are retained. For Codex startup and MCP registration, see the official [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) and [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) documentation.
+Read-only task content for completed, failed, and canceled tasks is pruned after 30 days when the executor next starts. Write task worktrees and review records stay until explicit user cleanup. Pending questions and reviewable tasks are retained. For Codex startup and MCP registration, see the official [Codex CLI](https://learn.chatgpt.com/docs/codex/cli) and [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) documentation.
 
 ### Agent operating contract
 
@@ -159,17 +167,17 @@ The task content for completed, failed, and canceled tasks is pruned after 30 da
 3. When the user requests automatic handoff, set `handoff="automatic"` and report the returned connection state. Otherwise use manual mode. Return the task ID and end the turn; do not poll for CC.
 4. When the user explicitly asks for progress, call `get_task(include_events=true)`. Start from the last cursor if known; otherwise start at 0 and use `has_more` and `next_cursor` to reach the newest events during this one check. Summarize only observed file activity and findings, not raw event streams or guessed completion. Never schedule repeated checks.
 5. For an automatic event, call `get_task`, check the current state and original acceptance criteria, take an authorized action, then call `ack_handoff`. Manual mode handles the same states on a later interaction. Never auto-replay failed or interrupted work.
-6. Put reusable public facts in the project shared file; return concise conclusions and evidence. Delegate independent work separately only when it can run in parallel. CC cannot edit files or run project tests in this release.
+6. Put reusable public facts in the project shared file; return concise conclusions and evidence. Delegate independent work separately only when it can run in parallel. Editing and test execution require the explicitly enabled native write backend.
 
 ## Authentication and safety
 
 Restricted Claude sessions inherit only selected Anthropic authentication, endpoint and model environment fields from the process environment or the user's Claude settings. Global MCP servers, plugins and broad tool grants are not inherited. Credentials are never passed in command-line arguments or returned by the MCP tools.
 
-Linux real tasks use bubblewrap to expose only a private read-only snapshot, Claude's own configuration and session data, the runtime needed for the internal question tool, and its local socket. The runner permits model-service network access but does not expose Claude command execution, WebFetch or browser tools. A missing sandbox fails the task. Project editing is not implemented.
+Linux read-only tasks use bubblewrap to expose only a private snapshot, Claude's own configuration and session data, the internal question tool, and its local socket. This runner does not expose command execution, WebFetch or browser tools. Native write tasks instead run with trusted-project command access in a Git worktree and do not use this isolation boundary.
 
 The CLI budget flag limits a single invocation; previous rounds are tracked separately. If reported cost is missing, continuation fails closed. The CLI's figures may differ from your provider's actual bill.
 
-Completed, failed and canceled task content is retained for 30 days, then pruned when the executor starts. Minimal task IDs and statuses remain. Tasks still waiting for an answer or review are not pruned. Claude's own session files are managed by Claude Code.
+Completed, failed and canceled read-only task content is retained for 30 days, then pruned when the executor starts. Write task worktrees and review records require explicit cleanup. Tasks still waiting for an answer or review are not pruned. Claude's own session files are managed by Claude Code.
 
 ## Compatibility and release gates
 

@@ -1,6 +1,6 @@
 # Codex1CC 自动接管执行计划
 
-状态：A0–A4 已完成实验实现；A5 的模拟端到端和一次真实 CC → Codex 自动验收已通过。真实问题交接、宿主运行中重启恢复及跨机器兼容性仍待验收。依据：[PRD v1.2](../Codex1CC%20产品需求文档.md)第 14 节。实测边界见[兼容性记录](handoff-compatibility.md)和[验证记录](validation.md)。
+状态：A0–A4 已完成实验实现；A5 的模拟端到端和一次真实 CC → Codex 自动验收已通过。真实问题交接、宿主运行中重启恢复及跨机器兼容性仍待验收。本文件记录 v1.2 自动接管范围；v1.3 写入能力见[写入后端计划](native-write-backend-plan.md)。依据：[当前 PRD](../Codex1CC%20产品需求文档.md)第 14 节。实测边界见[兼容性记录](handoff-compatibility.md)和[验证记录](validation.md)。
 
 ## 1. 交付目标
 
