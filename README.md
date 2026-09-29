@@ -89,6 +89,14 @@ This prompt uses the `demo` configuration above. Replace the project name, sourc
 
 Codex translates the request into a bounded task. CC can read only the selected snapshot and cannot execute project commands. A snapshot over 20 MiB or 2000 files is rejected; narrow the requested sources or authorize more specific paths. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Only one Codex1CC task can be active per project at a time.
 
+### See what CC is doing during a task
+
+You can ask Codex for a one-time progress check before the task finishes:
+
+> Check the CC task for the demo project. Summarize the recorded file reads, searches, findings, and blockers, and tell me when the last event occurred. If there is no new activity, say so. Check once; do not keep refreshing.
+
+Codex reads the saved execution events and turns them into a short account of observable progress. Each call returns at most 50 events; for a longer task, Codex can page through them **during that one check** to reach the newest events. This is not a live view of CC's screen: the CLI may omit internal steps, and long events may be truncated. There is no automatic progress notification or continuously updating monitor in this release. Ask again whenever you want another snapshot of progress.
+
 ### Return later, answer, review, or cancel
 
 You may close the Codex conversation. Reopen Codex in the project or resume the old conversation, then use the session-start prompt above. The executor stores task IDs, status, original objective, acceptance checks, scope, and results independently of the chat. If you know a task ID, ask:
@@ -116,8 +124,9 @@ The task content for completed, failed, and canceled tasks is pruned after 30 da
 1. Resolve the user's project name to an explicitly configured `project_id`; do not infer it from the current directory alone. On entering a session, call `list_tasks(project_id=..., statuses=["queued","running","continuing","waiting_answer","review_required","failed","interrupted"])` once as needed and fetch only actionable tasks.
 2. Submit each cohesive objective once, with complete context, exact allowed `scope`, acceptance checks, deliverables, question policy, and bounded cost/time. Generate a unique `request_id` per operation; preserve it on retry.
 3. After `submit_task`, return the task ID and accepted status, then end the turn. Do not poll or hold the conversation open for CC.
-4. On a later natural interaction, handle `waiting_answer` with `respond_task`, and `review_required` with evidence review followed by `continue_task` or `complete_task`. Never auto-replay `failed` or `interrupted` work.
-5. Put reusable public facts in the project shared file; return concise conclusions and evidence. Delegate independent work separately only when it can run in parallel. CC cannot edit files or run project tests in this release.
+4. When the user explicitly asks for progress, call `get_task(include_events=true)`. Start from the last cursor if known; otherwise start at 0 and use `has_more` and `next_cursor` to reach the newest events during this one check. Summarize only observed file activity and findings, not raw event streams or guessed completion. Never schedule repeated checks.
+5. On a later natural interaction, handle `waiting_answer` with `respond_task`, and `review_required` with evidence review followed by `continue_task` or `complete_task`. Never auto-replay `failed` or `interrupted` work.
+6. Put reusable public facts in the project shared file; return concise conclusions and evidence. Delegate independent work separately only when it can run in parallel. CC cannot edit files or run project tests in this release.
 
 ## Authentication and safety
 
