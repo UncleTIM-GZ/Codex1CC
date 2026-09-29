@@ -162,6 +162,7 @@ class ExecutorTest(unittest.TestCase):
             encoding="utf-8")
         health = self.call("doctor", {})
         self.assertTrue(health["data"]["native_write"]["projects"]["sample"]["ready"])
+        self.assertEqual(health["data"]["parallel"]["projects"]["sample"], 3)
         params = {"project_id": "sample", "objective": "Edit README", "context": "",
                   "acceptance": ["README changed"], "deliverables": ["Local commit"],
                   "scope": ["README.txt"], "actions": ["read", "write", "execute"],
@@ -241,6 +242,239 @@ class ExecutorTest(unittest.TestCase):
                     "review_note": "Inspected retained diff; accepted despite CLI exit error",
                     "request_id": uuid.uuid4().hex})
         self.assertEqual(reviewed["data"]["status"], "completed")
+
+    def test_context_policy_reaches_claude_and_context_error_keeps_worktree(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["context_policy"] = {
+            "auto_compact_window": 400000, "auto_compact_percent": 65}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('README.txt').write_text('partial work')\n"
+            "pathlib.Path('context-policy.txt').write_text("
+            "os.environ['CLAUDE_CODE_AUTO_COMPACT_WINDOW'] + ',' + "
+            "os.environ['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'])\n"
+            "print('API Error: 400 maximum context length exceeded', file=sys.stderr)\n"
+            "sys.exit(1)\n", encoding="utf-8")
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit README", "context": "",
+            "acceptance": ["README changed"], "deliverables": ["Diff"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        task_id = started["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "failed":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["exit_reason"], "CONTEXT_LIMIT", item)
+        self.assertIn("fresh Claude session", item["result"]["next_action"])
+        worktree = Path(item["result"]["workspace"]["worktree_path"])
+        self.assertEqual((worktree / "README.txt").read_text(), "partial work")
+        self.assertEqual((worktree / "context-policy.txt").read_text(), "400000,65")
+        self.assertEqual((self.root / "README.txt").read_text(), "public task content")
+
+    def test_invalid_context_policy_rejected_before_task_creation(self) -> None:
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["context_policy"] = {
+            "auto_compact_window": 50000}
+        self.config.write_text(json.dumps(config))
+        result = self.call("submit_task", {
+            "project_id": "sample", "objective": "Read README",
+            "acceptance": ["done"], "deliverables": ["result"],
+            "scope": ["README.txt"], "request_id": uuid.uuid4().hex})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_CONFIG")
+
+    def test_explicit_long_task_limit(self) -> None:
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["limits"]["seconds"] = 21600
+        self.config.write_text(json.dumps(config))
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Long review",
+            "acceptance": ["done"], "deliverables": ["result"],
+            "scope": ["README.txt"], "limits": {"seconds": 14400},
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        task = self.call("get_task", {"task_id": started["data"]["task_id"]})["data"]["task"]
+        self.assertEqual(task["request"]["limits"]["seconds"], 14400)
+
+    def test_reviewed_write_task_can_relay_to_fresh_session_in_same_worktree(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "path=pathlib.Path('README.txt')\n"
+            "if path.read_text() == 'public task content':\n"
+            " path.write_text('phase one')\n"
+            " print(json.dumps({'type':'result','session_id':'old-session','result':'Phase one',"
+            "'is_error':False,'total_cost_usd':0.01}),flush=True)\n"
+            "else:\n"
+            " path.write_text('phase two')\n"
+            " print(json.dumps({'type':'result','session_id':'new-session',"
+            "'result':'Fresh=' + str('--resume' not in sys.argv),"
+            "'is_error':False,'total_cost_usd':0.02}),flush=True)\n",
+            encoding="utf-8")
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Two phases", "context": "",
+            "acceptance": ["Phase two done"], "deliverables": ["Diff"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        task_id = started["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            first = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if first["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(first["status"], "review_required", first)
+        original_worktree = first["result"]["workspace"]["worktree_path"]
+        continued = self.call("continue_task", {
+            "task_id": task_id, "instruction": "Finish phase two", "fresh_session": True,
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(continued["ok"], continued)
+        self.assertTrue(continued["data"]["fresh_session"])
+        while time.monotonic() < deadline:
+            second = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if second["status"] == "review_required" and second["round_no"] == 2:
+                break
+            time.sleep(0.02)
+        self.assertEqual(second["status"], "review_required", second)
+        self.assertEqual(second["result"]["conclusion"], "Fresh=True")
+        self.assertEqual(second["session_id"], "new-session")
+        self.assertEqual(second["result"]["workspace"]["worktree_path"], original_worktree)
+        self.assertAlmostEqual(second["usage"]["total_cost_usd"], 0.03)
+
+    def test_fresh_session_relay_rejects_read_only_task(self) -> None:
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "Read README",
+            "acceptance": ["done"], "deliverables": ["result"],
+            "scope": ["README.txt"], "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        task_id = started["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            task = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if task["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(task["status"], "review_required", task)
+        refused = self.call("continue_task", {
+            "task_id": task_id, "instruction": "Try to relay", "fresh_session": True,
+            "request_id": uuid.uuid4().hex})
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["error"]["code"], "INVALID_STATE")
+
+    def test_independent_tasks_run_in_parallel_but_conflicts_remain_serial(self) -> None:
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["read_paths"].extend(["PRIVATE.txt", "CONTEXT.txt"])
+        config["projects"]["sample"]["parallel"] = {"max_agents": 2}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, time\n"
+            "time.sleep(0.8)\n"
+            "print(json.dumps({'type':'result','session_id':'independent-session',"
+            "'result':'Done','is_error':False,'total_cost_usd':0.01}),flush=True)\n",
+            encoding="utf-8")
+
+        def submit(scope: str, parallel_ok: bool) -> dict:
+            return self.call("submit_task", {
+                "project_id": "sample", "objective": "Inspect " + scope,
+                "acceptance": ["done"], "deliverables": ["result"],
+                "scope": [scope], "parallel_ok": parallel_ok,
+                "request_id": uuid.uuid4().hex})
+
+        first = submit("README.txt", True)
+        second = submit("PRIVATE.txt", True)
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertNotEqual(first["data"]["task_id"], second["data"]["task_id"])
+        running_deadline = time.monotonic() + 0.5
+        while time.monotonic() < running_deadline:
+            current = [self.call("get_task", {"task_id": task["data"]["task_id"]})
+                       ["data"]["task"]["status"] for task in (first, second)]
+            if current == ["running", "running"]:
+                break
+            time.sleep(0.02)
+        self.assertEqual(current, ["running", "running"])
+        conflict = submit("README.txt", True)
+        self.assertFalse(conflict["ok"])
+        self.assertEqual(conflict["error"]["code"], "PROJECT_BUSY")
+        at_limit = submit("CONTEXT.txt", True)
+        self.assertFalse(at_limit["ok"])
+        self.assertEqual(at_limit["error"]["code"], "PROJECT_BUSY")
+        serial = submit("CONTEXT.txt", False)
+        self.assertFalse(serial["ok"])
+        self.assertEqual(serial["error"]["code"], "PROJECT_BUSY")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            states = [self.call("get_task", {"task_id": task["data"]["task_id"]})
+                      ["data"]["task"]["status"] for task in (first, second)]
+            if states == ["review_required", "review_required"]:
+                break
+            time.sleep(0.02)
+        self.assertEqual(states, ["review_required", "review_required"])
+
+    def test_parallel_scope_conflicts_include_parent_paths(self) -> None:
+        from codex1cc.daemon import Executor
+
+        self.assertTrue(Executor._scope_conflict(["src"], ["src/module.py"]))
+        self.assertTrue(Executor._scope_conflict(["src/module.py"], ["src"]))
+        self.assertTrue(Executor._scope_conflict(["."], ["docs/guide.md"]))
+        self.assertFalse(Executor._scope_conflict(["src"], ["src2/module.py"]))
+
+    def test_parallel_write_agents_use_separate_worktrees(self) -> None:
+        self._enable_write_backend(["README.txt", "PRIVATE.txt"])
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["parallel"] = {"max_agents": 2}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys, time\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --max-budget-usd --strict-mcp-config --resume'); sys.exit(0)\n"
+            "name='README.txt' if 'README.txt' in sys.argv[-1] else 'PRIVATE.txt'\n"
+            "pathlib.Path(name).write_text('edited ' + name)\n"
+            "time.sleep(0.6)\n"
+            "print(json.dumps({'type':'result','session_id':'session-'+name,"
+            "'result':'Done','is_error':False,'total_cost_usd':0.01}),flush=True)\n",
+            encoding="utf-8")
+
+        def submit(scope: str) -> dict:
+            return self.call("submit_task", {
+                "project_id": "sample", "objective": "Edit " + scope, "context": "",
+                "acceptance": [scope + " changed"], "deliverables": ["Diff"],
+                "scope": [scope], "actions": ["read", "write", "execute"],
+                "parallel_ok": True, "request_id": uuid.uuid4().hex})
+
+        first, second = submit("README.txt"), submit("PRIVATE.txt")
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(submit("README.txt")["error"]["code"], "PROJECT_BUSY")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            tasks = [self.call("get_task", {"task_id": response["data"]["task_id"]})
+                     ["data"]["task"] for response in (first, second)]
+            if all(task["status"] == "review_required" for task in tasks):
+                break
+            time.sleep(0.02)
+        self.assertTrue(all(task["status"] == "review_required" for task in tasks), tasks)
+        worktrees = [task["result"]["workspace"]["worktree_path"] for task in tasks]
+        self.assertNotEqual(*worktrees)
+        self.assertEqual(tasks[0]["result"]["workspace"]["changed_paths"], ["README.txt"])
+        self.assertEqual(tasks[1]["result"]["workspace"]["changed_paths"], ["PRIVATE.txt"])
+        self.assertEqual((self.root / "README.txt").read_text(), "public task content")
+        self.assertEqual((self.root / "PRIVATE.txt").read_text(), "private marker")
 
     def test_symlink_scope_fails_closed(self) -> None:
         (self.root / "linked.txt").symlink_to(self.root / "PRIVATE.txt")

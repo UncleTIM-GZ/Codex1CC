@@ -74,11 +74,19 @@ For automatic handoff, require the project to be connected in
 `codex1cc doctor`; do not downgrade silently to manual mode.
 
 Call `list_tasks` once for active statuses before submission. Do not submit a
-duplicate when the project already has an active task. Build one cohesive task
-with the complete objective, relevant public context, measurable acceptance
-criteria, expected deliverables, exact authorized scope, limits, and question
-policy. Keep linked small steps together. Split work only when tasks are truly
-independent and the configured projects allow parallel execution.
+duplicate. Build one cohesive task with the complete objective, relevant public
+context, measurable acceptance criteria, expected deliverables, exact authorized
+scope, limits, and question policy. Keep linked small steps together. Split work
+only when tasks are truly independent. The default project limit is 3; for
+parallel work in one project, require an effective `parallel.max_agents > 1`
+and explicit authorization that the tasks are
+independent. Inspect each active task's scope with `get_task` as needed. Set
+`parallel_ok=true` only when the tasks have no semantic dependency or path
+overlap; each accepted task gets its own CC process, session, and write
+worktree. If a task conflicts or reaches the agent limit, keep it serial:
+report the blocker and submit it only after the earlier task is reviewed and
+its changes are integrated into the new baseline. Do not schedule MCP polling
+or silently resubmit the rejected task.
 
 Call `submit_task` once with a new stable `request_id`. Reuse that same ID only
 to retry an uncertain identical request. Set `handoff="automatic"` when the
@@ -105,6 +113,11 @@ When Codex1CC delivers a question, result, failure, or interruption:
    may explicitly accept it while retaining the original failure reason.
    Keep the worktree until the user explicitly
    requests cleanup; do not merge, push, or deploy on task completion alone.
+   When a reviewed write task has a documented next phase and known remaining
+   budget, use `continue_task(..., fresh_session=true)` if a new context is
+   needed. Check the existing commits, dirty files, and test evidence first;
+   this starts a new CC session in the same managed worktree and counts as a
+   new round.
 4. Call `ack_handoff` with the delivered `event_id`, `receipt_token`, and the
    outcome that matches the action: `completed`, `answered`, `continued`,
    `needs_user`, `reviewed`, or `failed`.
@@ -122,6 +135,14 @@ leave the task unsubmitted. On `needs_reconcile`, inspect the saved `turn_id`
 and Codex result. Never redeliver the old event. Call `ack_handoff` only after
 the original turn and its effects are verified; otherwise leave it for user
 review.
+
+On `CONTEXT_LIMIT`, inspect the retained task worktree, commits, changed files,
+test logs, and remaining budget. Do not resume or retry the overflowing Claude
+session. A fresh-session relay is available only after a write task has normally
+reached `review_required`, its work has been reviewed, and its remaining budget
+is known. A failed task needs an explicit review and a new scoped task on a
+verified Git baseline; do not silently restart it. Do not claim to manage Claude
+background jobs that were started outside Codex1CC.
 
 Do not expose receipt tokens, configuration contents, credentials, private
 absolute paths, or raw internal event logs in the user-facing response.

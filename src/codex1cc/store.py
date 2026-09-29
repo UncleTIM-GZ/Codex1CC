@@ -59,8 +59,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if existing_database and self.db.execute("PRAGMA user_version").fetchone()[0] < 2:
-            backup_path = path.with_name(path.name + f".pre-v2-{uuid.uuid4().hex[:8]}.bak")
+        if existing_database and self.db.execute("PRAGMA user_version").fetchone()[0] < 3:
+            backup_path = path.with_name(path.name + f".pre-v3-{uuid.uuid4().hex[:8]}.bak")
             fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
             try:
@@ -102,8 +102,8 @@ class Store:
           CREATE TABLE IF NOT EXISTS operations (
             request_id TEXT PRIMARY KEY, method TEXT NOT NULL, response_json TEXT NOT NULL
           );
-          CREATE UNIQUE INDEX IF NOT EXISTS active_project_one ON tasks(project_id)
-            WHERE status IN ('queued','running','waiting_answer','continuing');
+          DROP INDEX IF EXISTS active_project_one;
+          CREATE INDEX IF NOT EXISTS active_project_lookup ON tasks(project_id,status);
           CREATE TABLE IF NOT EXISTS handoff_events (
             id TEXT PRIMARY KEY, task_id TEXT NOT NULL, round_no INTEGER NOT NULL,
             event_key TEXT NOT NULL,
@@ -128,7 +128,7 @@ class Store:
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS round_request_one ON rounds(request_id) WHERE request_id IS NOT NULL")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS complete_request_one ON tasks(complete_request_id) WHERE complete_request_id IS NOT NULL")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS cancel_request_one ON tasks(cancel_request_id) WHERE cancel_request_id IS NOT NULL")
-        self.db.execute("PRAGMA user_version=2")
+        self.db.execute("PRAGMA user_version=3")
         self.db.commit()
 
     def one(self, task_id: str) -> dict:
@@ -478,6 +478,16 @@ class Store:
         row = self.db.execute("SELECT id FROM tasks WHERE project_id=? AND status IN ('queued','running','waiting_answer','continuing') AND id != ? LIMIT 1",
                               (project_id, exclude or "")).fetchone()
         return row is not None
+
+    def active(self, project_id: str, exclude: str | None = None) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT id,status,bundle_json FROM tasks WHERE project_id=? "
+            "AND status IN ('queued','running','waiting_answer','continuing') AND id!=? "
+            "ORDER BY created_at",
+            (project_id, exclude or "")).fetchall()
+        return [{"id": row["id"], "status": row["status"],
+                 "bundle": json.loads(row["bundle_json"] or "{}")}
+                for row in rows]
 
     def prune_terminal_history(self, retention_days: int = 30) -> int:
         """Remove old task content; keep minimal IDs and terminal statuses."""

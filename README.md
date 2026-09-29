@@ -10,7 +10,7 @@ Install Codex1CC where it can access your project files and Claude Code. Codex c
 
 Licensed under MIT; see [LICENSE](LICENSE).
 
-Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), and [PRD v1.3](Codex1CC%20产品需求文档.md). Manual use remains available.
+Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), [long-running task plan](docs/long-running-tasks-plan.md), [parallel agent plan](docs/parallel-agents-plan.md), and [PRD v1.5](Codex1CC%20产品需求文档.md). Manual use remains available.
 
 ## How the pieces fit together
 
@@ -71,6 +71,12 @@ Edit the displayed JSON config. Keep it readable only by your user (mode 0600). 
 Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. The configured `seconds`, `usd`, and `rounds` are project caps. A task can lower its time and USD caps, while the round cap comes from project configuration.
 
 Create the shared context file inside the target project before submitting a task. Record authoritative document paths, stable constraints, and reusable public facts; exclude credentials and unverified status claims. Claude receives a fixed copy even if it is not in the requested `scope`. For read-only tasks, selected paths are copied into a private snapshot; symbolic links and special files are rejected. Each task path must exactly match a configured `read_paths` entry: if `docs` is allowed, request `docs`, not an unlisted `docs/file.md`. Exclude generated assets and caches; a read-only snapshot is limited to 20 MiB and 2000 files.
+
+### Long-running tasks and context protection
+
+For tasks it launches, Codex1CC asks Claude Code to compact earlier: by default, at 70% of an auto-compact window capped at 500000 tokens. Claude Code caps that window at the model's actual context size if smaller. Per-project settings may override this, for example `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`. The allowed window is 100000–1000000 tokens and the percentage is 1–90; actual behavior also depends on the CLI, model, and Claude settings. To allow a task longer than one hour, explicitly raise project `limits.seconds`, up to 86400; each task can only lower that cap. Write long gate output to files and return a conclusion, exit code, and path.
+
+After a write task delivers a reviewed phase, Codex can check the artifacts and known cumulative cost, then call `continue_task(..., fresh_session=true)` to start a new CC session in the same task worktree without loading the old conversation. If CC still exceeds its context window, the task fails with `CONTEXT_LIMIT` and retains its write worktree. Automatic handoff asks Codex to inspect the evidence. The overflowing session is never retried automatically. Unattended checkpoint and relay remain unimplemented and unvalidated. Claude Code background jobs started outside Codex1CC are not managed by this task mechanism. See the [long-running task plan](docs/long-running-tasks-plan.md).
 
 ### Optional native CC editing (experimental)
 
@@ -172,7 +178,9 @@ This prompt uses the `demo` configuration above. Replace the project name, sourc
 
 > Ask CC to compare the demo project's README and `docs` with the relevant `src` files. Identify claims that the code does not support or that still need verification. Give a file path for each finding and separate confirmed facts from questions. This is analysis only: do not edit files or claim to have run tests. Return a short conclusion and the first suggested follow-up task. Once delegated, give me the task number; we can review the result when I return.
 
-Codex translates the request into a bounded task. CC can read only the selected snapshot and cannot execute project commands. A snapshot over 20 MiB or 2000 files is rejected; narrow the requested sources or authorize more specific paths. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Only one Codex1CC task can be active per project at a time.
+Codex translates the request into a bounded task. CC can read only the selected snapshot and cannot execute project commands. A snapshot over 20 MiB or 2000 files is rejected; narrow the requested sources or authorize more specific paths. Keep tightly coupled steps together. Split work only when the parts are independent and can actually run in parallel. Each project allows up to three active tasks by default. Codex must explicitly set `parallel_ok=true` on every confirmed independent task; tasks without that declaration remain serial. Set `"parallel": {"max_agents": 1}` to restrict a project to serial execution, or choose a limit from 1 to 4. Each accepted task uses its own CC process, session, and write worktree. These are Codex1CC-managed workers, not Claude Code's built-in Agent tool. Overlapping scopes, serial tasks, and agent-limit overflow are refused while active. Submit conflicting work only after the prior result is reviewed and the new Git baseline contains its required changes; Codex1CC does not queue a task against a stale base. The parallel path has passed fake-CLI tests; real concurrent model runs remain unverified.
+
+> Use `$codex1cc-ops`: give CC the independent demo tasks A and B in parallel, each with a separate, non-overlapping edit scope and acceptance checks. If they depend on each other or share a path, finish and review the first task, verify the second task's Git baseline, then submit it. Review delivery events without timed polling.
 
 ### See what CC is doing during a task
 

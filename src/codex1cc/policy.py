@@ -68,6 +68,22 @@ def project_config(project_id: str) -> dict:
     limits = config.get("limits", {})
     if not isinstance(limits, dict):
         raise BridgeError("INVALID_CONFIG", "limits must be an object")
+    context_policy = config.get("context_policy", {})
+    if not isinstance(context_policy, dict) or any(
+            key not in {"auto_compact_window", "auto_compact_percent"} for key in context_policy):
+        raise BridgeError("INVALID_CONFIG", "Invalid context_policy settings")
+    window = context_policy.get("auto_compact_window", 500000)
+    percent = context_policy.get("auto_compact_percent", 70)
+    if type(window) is not int or not 100000 <= window <= 1000000:
+        raise BridgeError("INVALID_CONFIG", "context_policy.auto_compact_window must be 100000 through 1000000")
+    if type(percent) is not int or not 1 <= percent <= 90:
+        raise BridgeError("INVALID_CONFIG", "context_policy.auto_compact_percent must be 1 through 90")
+    parallel = config.get("parallel", {})
+    if not isinstance(parallel, dict) or any(key != "max_agents" for key in parallel):
+        raise BridgeError("INVALID_CONFIG", "Invalid parallel settings")
+    max_agents = parallel.get("max_agents", 3)
+    if type(max_agents) is not int or not 1 <= max_agents <= 4:
+        raise BridgeError("INVALID_CONFIG", "parallel.max_agents must be 1 through 4")
     cli = config.get("claude_path")
     if cli is not None and (not isinstance(cli, str) or not Path(cli).is_absolute() or not Path(cli).is_file()):
         raise BridgeError("INVALID_CONFIG", "claude_path must be an absolute executable file path")
@@ -86,7 +102,9 @@ def project_config(project_id: str) -> dict:
             raise BridgeError("INVALID_CONFIG", "handoff.turn_seconds must be 30 through 3600")
     return {"root": str(root), "read_paths": paths, "shared_context": shared,
             "limits": limits, "claude_path": config.get("claude_path"),
-            "model": model, "handoff": handoff, "write_backend": write_backend}
+            "model": model, "handoff": handoff, "write_backend": write_backend,
+            "context_policy": {"auto_compact_window": window, "auto_compact_percent": percent},
+            "parallel": {"max_agents": max_agents}}
 
 
 def validate_relative(value: str) -> Path:

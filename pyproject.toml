@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex1cc"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local, persistent Claude Code task executor for Codex"
 requires-python = ">=3.10"
 dependencies = ["mcp==1.26.0", "websockets>=13,<17"]

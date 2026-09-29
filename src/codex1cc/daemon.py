@@ -132,6 +132,31 @@ class Executor:
         request_id = safe_id(params.get("request_id"), "request_id")
         return request_id, self.store.operation(request_id, method)
 
+    @staticmethod
+    def _scope_conflict(left: list[str], right: list[str]) -> bool:
+        for a in left:
+            for b in right:
+                if a == "." or b == ".":
+                    return True
+                a_parts, b_parts = Path(a).parts, Path(b).parts
+                if a_parts[:len(b_parts)] == b_parts or b_parts[:len(a_parts)] == a_parts:
+                    return True
+        return False
+
+    def _admit_parallel(self, project_id: str, project: dict, bundle: dict,
+                        exclude: str | None = None) -> None:
+        active = self.store.active(project_id, exclude)
+        if not active:
+            return
+        maximum = project.get("parallel", {}).get("max_agents", 3)
+        if not bundle.get("parallel_ok") or maximum <= 1 or len(active) >= maximum:
+            raise BridgeError("PROJECT_BUSY", "Project agent limit reached or task is serial")
+        for other in active:
+            existing = other["bundle"]
+            if (not existing.get("parallel_ok") or
+                    self._scope_conflict(bundle["scope"], existing.get("scope", []))):
+                raise BridgeError("PROJECT_BUSY", "Task scope conflicts with an active task; integrate its baseline before submitting")
+
     def ack_handoff(self, params: dict) -> dict:
         event_id = safe_id(params.get("event_id"), "event_id")
         receipt_token = params.get("receipt_token")
@@ -396,14 +421,15 @@ class Executor:
             return existing
         project_id = safe_id(params.get("project_id"), "project_id")
         project = project_config(project_id)
-        if self.store.busy(project_id):
-            raise BridgeError("PROJECT_BUSY", "Another task is active in this project")
         objective = self._text(params.get("objective"), "objective")
         acceptance = params.get("acceptance")
         deliverables = params.get("deliverables")
         context = params.get("context", "")
         question_policy = params.get("question_policy", "")
         scope = params.get("scope")
+        parallel_ok = params.get("parallel_ok", False)
+        if type(parallel_ok) is not bool:
+            raise BridgeError("INVALID_ARGUMENT", "parallel_ok must be boolean")
         actions = params.get("actions", ["read"])
         limits = params.get("limits", {})
         if not isinstance(acceptance, list) or not acceptance or not all(isinstance(x, str) and x.strip() for x in acceptance):
@@ -425,8 +451,8 @@ class Executor:
             project_ready(project)
         if not isinstance(limits, dict):
             raise BridgeError("INVALID_ARGUMENT", "limits must be an object")
-        configured_max = self._number(project.get("limits", {}).get("seconds", 3600), 1, 3600)
-        max_seconds = self._number(limits.get("seconds", configured_max), 1, 3600)
+        configured_max = self._number(project.get("limits", {}).get("seconds", 3600), 1, 86400)
+        max_seconds = self._number(limits.get("seconds", configured_max), 1, 86400)
         if max_seconds > configured_max:
             raise BridgeError("LIMIT_REACHED", "Task time exceeds project limit")
         project_budget = project.get("limits", {}).get("usd", 0.25)
@@ -449,8 +475,7 @@ class Executor:
             capability = await AppServerHost().probe(binding)
             if not capability.connected:
                 raise BridgeError("HANDOFF_UNAVAILABLE", capability.reason)
-            if self.store.busy(project_id):
-                raise BridgeError("PROJECT_BUSY", "Another task is active in this project")
+        self._admit_parallel(project_id, project, {"scope": scope, "parallel_ok": parallel_ok})
         task_id = uuid.uuid4().hex
         workspace = None
         if write_task:
@@ -466,6 +491,7 @@ class Executor:
             digest, snapshot_info = snapshot(project, scope, snapshot_path)
         bundle = {"objective": objective, "acceptance": acceptance, "deliverables": deliverables,
                   "context": context, "scope": scope, "actions": actions,
+                  "parallel_ok": parallel_ok,
                   "task_id": task_id,
                   "backend": "native_write" if write_task else "read_only", "workspace": workspace,
                   "limits": {"seconds": max_seconds, "usd": float(budget), "rounds": max_rounds},
@@ -503,11 +529,17 @@ class Executor:
         if existing:
             return existing
         item = self.store.one(safe_id(params.get("task_id"), "task_id"))
+        fresh_session = params.get("fresh_session", False)
+        if type(fresh_session) is not bool:
+            raise BridgeError("INVALID_ARGUMENT", "fresh_session must be boolean")
         resumable = item["status"] == "review_required" or (
             item["status"] == "interrupted" and item["bundle"].get("backend") == "native_write"
             and item["exit_reason"] == "daemon_restart")
         if not resumable or not item["session_id"]:
             raise BridgeError("INVALID_STATE", "Task cannot be resumed")
+        if fresh_session and (item["status"] != "review_required" or
+                              item["bundle"].get("backend") != "native_write"):
+            raise BridgeError("INVALID_STATE", "Fresh-session relay requires a reviewed write task")
         if item["bundle"].get("backend") == "native_write":
             verify_worktree(item["project"]["root"], item["bundle"]["workspace"])
             if item["status"] == "interrupted" and not isinstance(
@@ -520,16 +552,17 @@ class Executor:
             if not isinstance(observed, (int, float)) or observed >= item["bundle"]["limits"]["usd"]:
                 raise BridgeError("LIMIT_REACHED", "Task budget reached or cost is unknown")
         instruction = self._text(params.get("instruction"), "instruction")
-        if self.store.busy(item["project_id"], item["id"]):
-            raise BridgeError("PROJECT_BUSY", "Another task is active in this project")
+        self._admit_parallel(item["project_id"], item["project"], item["bundle"], item["id"])
         round_no = item["round_no"] + 1
         self.store.transition(item["id"], "continuing", {"round_no": round_no},
                               before=("INSERT INTO rounds(task_id,round_no,instruction,status,request_id) VALUES(?,?,?,?,?)",
                                       (item["id"], round_no, instruction, "queued", request_id)),
                               status="continuing", round_no=round_no, result_json=None)
-        result = {"task_id": item["id"], "round_no": round_no, "status": "continuing"}
+        result = {"task_id": item["id"], "round_no": round_no, "status": "continuing",
+                  "fresh_session": fresh_session}
         self.store.save_operation(request_id, "continue_task", result)
-        self.jobs[item["id"]] = asyncio.create_task(self.run_task(item["id"], instruction))
+        self.jobs[item["id"]] = asyncio.create_task(
+            self.run_task(item["id"], instruction, fresh_session=fresh_session))
         return result
 
     def complete(self, params: dict) -> dict:
@@ -640,7 +673,8 @@ class Executor:
                 os.killpg(proc.pid, signal.SIGKILL)
                 await proc.wait()
 
-    async def run_task(self, task_id: str, instruction: str | None = None) -> None:
+    async def run_task(self, task_id: str, instruction: str | None = None,
+                       *, fresh_session: bool = False) -> None:
         item = self.store.one(task_id)
         bundle, project = item["bundle"], item["project"]
         write_task = bundle.get("backend") == "native_write"
@@ -651,7 +685,8 @@ class Executor:
         if not cli or not Path(cli).exists():
             self._fail(task_id, "CLI_FAILED", "Claude CLI is unavailable")
             return
-        prompt = instruction or self._prompt(bundle)
+        prompt = (self._fresh_prompt(bundle, instruction) if fresh_session
+                  else instruction or self._prompt(bundle))
         mcp_dir = STATE / "mcp"
         private_dir(mcp_dir)
         mcp_config = mcp_dir / f"{task_id}.json"
@@ -678,7 +713,7 @@ class Executor:
                         "--tools", "Read,Glob,Grep", "--max-budget-usd", str(remaining_budget)]
         if project.get("model"):
             command += ["--model", project["model"]]
-        if item["session_id"]:
+        if item["session_id"] and not fresh_session:
             command += ["--resume", item["session_id"]]
         command.append(prompt)
         allowed_env = {"PATH", "HOME", "LANG", "LC_ALL", "PYTHONPATH", "CODEX1CC_STATE_DIR",
@@ -695,6 +730,10 @@ class Executor:
             return
         env["CODEX1CC_TASK_ID"] = task_id
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+        context_policy = project.get("context_policy") or {
+            "auto_compact_window": 500000, "auto_compact_percent": 70}
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(context_policy["auto_compact_window"])
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(context_policy["auto_compact_percent"])
         if env.get("CLAUDE_CONFIG_DIR"):
             env["CLAUDE_CONFIG_DIR"] = str(Path(env["CLAUDE_CONFIG_DIR"]).expanduser().resolve())
         try:
@@ -768,7 +807,11 @@ class Executor:
             if self.store.one(task_id)["status"] in {"canceled", "review_required"}:
                 return
             if code or not result or result.get("is_error"):
-                self._fail(task_id, "CLI_FAILED", stderr or last_error or "Claude did not return a successful result")
+                detail = " ".join(filter(None, (stderr, last_error,
+                                                  str(result.get("result", "")) if result else "")))
+                context_limit = self._context_limit_error(detail)
+                self._fail(task_id, "CONTEXT_LIMIT" if context_limit else "CLI_FAILED",
+                           detail or "Claude did not return a successful result")
                 return
             summary = self._summary(result)
             if write_task:
@@ -817,6 +860,13 @@ class Executor:
             "每项最多一句，总计尽量不超过 300 字。"
         )
 
+    @classmethod
+    def _fresh_prompt(cls, bundle: dict, instruction: str | None) -> str:
+        return (cls._prompt(bundle) + "\n本轮在同一任务工作树中使用全新 CC 会话。"
+                "先核对当前分支、已有提交、未提交改动和验收证据；不要重复已完成的工作。"
+                f"本轮明确指令：{instruction or ''}\n"
+                "门禁日志保留在文件中，只回报结论、退出码与路径。")
+
     @staticmethod
     def _summary(result: dict) -> dict:
         value = result.get("result", "")
@@ -824,6 +874,13 @@ class Executor:
                 "subtype": result.get("subtype"),
                 "session_id": result.get("session_id"),
                 "cost_usd": result.get("total_cost_usd")}
+
+    @staticmethod
+    def _context_limit_error(detail: str) -> bool:
+        lower = detail.lower()
+        return any(marker in lower for marker in (
+            "maximum context length", "context window exceeded", "context_length_exceeded",
+            "prompt is too long", "too many tokens in prompt"))
 
     @staticmethod
     async def _collect_stderr(stream: asyncio.StreamReader) -> str:
@@ -842,6 +899,10 @@ class Executor:
             return
         safe_message = scrub(message[:2000])
         summary = {"conclusion": safe_message}
+        if code == "CONTEXT_LIMIT":
+            summary["next_action"] = (
+                "Review the saved work and usage before starting a fresh Claude session. "
+                "Do not resume or retry the overflowing session automatically.")
         bundle = item.get("bundle") or {}
         if bundle.get("backend") == "native_write":
             try:
@@ -858,10 +919,12 @@ class Executor:
     def doctor(self) -> dict:
         ready, reason = linux_available()
         write_projects = {}
+        parallel_projects = {}
         try:
             for project_id in projects():
                 try:
                     project = project_config(project_id)
+                    parallel_projects[project_id] = project["parallel"]["max_agents"]
                     if project["write_backend"].get("enabled"):
                         project_ready(project)
                         write_projects[project_id] = {"enabled": True, "ready": True}
@@ -877,7 +940,8 @@ class Executor:
                 "state_path": str(STATE), "sandbox_ready": ready, "reason": reason,
                 "mode": "read_only" if ready else "disabled",
                 "native_write": {"available": bool(shutil.which("git") and shutil.which("claude")),
-                                 "trust_required": True, "projects": write_projects}}
+                                 "trust_required": True, "projects": write_projects},
+                "parallel": {"projects": parallel_projects}}
 
 
 async def serve() -> None:

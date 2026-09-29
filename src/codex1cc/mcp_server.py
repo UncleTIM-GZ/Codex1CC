@@ -18,7 +18,7 @@ async def submit_task(project_id: str, objective: str, context: str,
                       acceptance: list[str], deliverables: list[str], scope: list[str],
                       request_id: str, question_policy: str = "",
                       limits: dict | None = None, actions: list[str] | None = None,
-                      handoff: str = "manual") -> dict:
+                      handoff: str = "manual", parallel_ok: bool = False) -> dict:
     """Submit one complete, bounded task to the configured project."""
     if handoff == "automatic":
         backend = await rpc("doctor")
@@ -29,7 +29,7 @@ async def submit_task(project_id: str, objective: str, context: str,
                                      "deliverables": deliverables, "scope": scope,
                                      "request_id": request_id, "question_policy": question_policy,
                                      "limits": limits or {}, "actions": actions if actions is not None else ["read"],
-                                     "handoff": handoff})
+                                     "handoff": handoff, "parallel_ok": parallel_ok})
 
 
 @server.tool()
@@ -55,10 +55,12 @@ async def respond_task(task_id: str, question_id: str, answer: str, request_id: 
 
 
 @server.tool()
-async def continue_task(task_id: str, instruction: str, request_id: str) -> dict:
-    """Continue a reviewed Claude session with an explicit instruction."""
+async def continue_task(task_id: str, instruction: str, request_id: str,
+                        fresh_session: bool = False) -> dict:
+    """Continue reviewed work; optionally start fresh context in the same write worktree."""
     return await rpc("continue_task", {"task_id": task_id, "instruction": instruction,
-                                       "request_id": request_id})
+                                       "request_id": request_id,
+                                       "fresh_session": fresh_session})
 
 
 @server.tool()
