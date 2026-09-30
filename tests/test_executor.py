@@ -252,6 +252,71 @@ class ExecutorTest(unittest.TestCase):
                     "request_id": uuid.uuid4().hex})
         self.assertEqual(reviewed["data"]["status"], "completed")
 
+    def test_failed_write_task_can_relay_to_fresh_session_in_same_worktree(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "pathlib.Path('README.txt').write_text('partial change')\n"
+            "sys.exit(3)\n", encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Edit README", "context": "",
+            "acceptance": ["README changed"], "deliverables": ["Commit"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "limits": {"rounds": 2}, "request_id": uuid.uuid4().hex})
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "failed":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["status"], "failed", item)
+
+        database = sqlite3.connect(self.state / "state.sqlite3")
+        raw_bundle = database.execute(
+            "SELECT bundle_json FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+        legacy_bundle = json.loads(raw_bundle)
+        legacy_bundle["limits"].pop("wall_seconds")
+        database.execute("UPDATE tasks SET bundle_json=? WHERE id=?",
+                         (json.dumps(legacy_bundle), task_id))
+        database.commit()
+        database.close()
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["limits"]["wall_seconds"] = 60
+        self.config.write_text(json.dumps(config))
+
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, subprocess, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "assert '--resume' not in sys.argv\n"
+            "assert pathlib.Path('README.txt').read_text() == 'partial change'\n"
+            "pathlib.Path('README.txt').write_text('completed change')\n"
+            "subprocess.run(['git','add','README.txt'],check=True)\n"
+            "subprocess.run(['git','commit','-qm','finish recovered task'],check=True)\n"
+            "print(json.dumps({'type':'result','session_id':'fresh-session','result':'Recovered',"
+            "'is_error':False}),flush=True)\n", encoding="utf-8")
+        continued = self.call("continue_task", {
+            "task_id": task_id,
+            "instruction": "The retained diff was inspected. Finish it and run acceptance tests.",
+            "fresh_session": True, "request_id": uuid.uuid4().hex})
+        self.assertTrue(continued["ok"], continued)
+        self.assertTrue(continued["data"]["fresh_session"])
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "review_required":
+                break
+            time.sleep(0.02)
+        self.assertEqual(item["status"], "review_required", item)
+        self.assertEqual(item["result"]["conclusion"], "Recovered")
+        self.assertEqual(item["request"]["limits"]["wall_seconds"], 60)
+        self.assertTrue(item["result"]["workspace"]["commits"][0].endswith(
+            " finish recovered task"))
+
     def test_context_policy_reaches_claude_and_context_error_keeps_worktree(self) -> None:
         self._enable_write_backend(["README.txt"])
         config = json.loads(self.config.read_text())
@@ -313,6 +378,102 @@ class ExecutorTest(unittest.TestCase):
         self.assertTrue(started["ok"], started)
         task = self.call("get_task", {"task_id": started["data"]["task_id"]})["data"]["task"]
         self.assertEqual(task["request"]["limits"]["seconds"], 14400)
+
+    def test_external_command_pauses_agent_clock_but_not_wall_clock(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["limits"] = {
+            "seconds": 2, "wall_seconds": 6, "rounds": 3}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, subprocess, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "subprocess.run([sys.executable,'-c','import time; time.sleep(3)'],check=True)\n"
+            "print(json.dumps({'type':'result','session_id':'command-session',"
+            "'result':'test command completed','is_error':False}),flush=True)\n",
+            encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Run a long test", "context": "",
+            "acceptance": ["Test completes"], "deliverables": ["Result"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] in {"review_required", "failed"}:
+                break
+            time.sleep(0.05)
+        self.assertEqual(item["status"], "review_required", item)
+        self.assertEqual(item["result"]["conclusion"], "test command completed")
+        self.assertEqual(item["request"]["limits"], {
+            "seconds": 2, "wall_seconds": 6, "rounds": 3})
+
+    def test_agent_clock_still_limits_pure_cc_work(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["limits"] = {
+            "seconds": 2, "wall_seconds": 6, "rounds": 3}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys, time\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "time.sleep(3)\n"
+            "print(json.dumps({'type':'result','session_id':'agent-session',"
+            "'result':'too late','is_error':False}),flush=True)\n",
+            encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Think without commands", "context": "",
+            "acceptance": ["Finish"], "deliverables": ["Result"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "failed":
+                break
+            time.sleep(0.05)
+        self.assertEqual(item["status"], "failed", item)
+        self.assertEqual(item["exit_reason"], "LIMIT_REACHED")
+        self.assertEqual(item["result"]["conclusion"], "CC agent work time limit reached")
+
+    def test_wall_clock_still_limits_external_command(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        config = json.loads(self.config.read_text())
+        config["projects"]["sample"]["limits"] = {
+            "seconds": 2, "wall_seconds": 2, "rounds": 3}
+        self.config.write_text(json.dumps(config))
+        self.cli.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, subprocess, sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "subprocess.run([sys.executable,'-c','import time; time.sleep(3)'],check=True)\n"
+            "print(json.dumps({'type':'result','session_id':'command-session',"
+            "'result':'too late','is_error':False}),flush=True)\n",
+            encoding="utf-8")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Run an overlong test", "context": "",
+            "acceptance": ["Stop at hard cap"], "deliverables": ["Failure"],
+            "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            item = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if item["status"] == "failed":
+                break
+            time.sleep(0.05)
+        self.assertEqual(item["status"], "failed", item)
+        self.assertEqual(item["result"]["conclusion"], "Task hard wall time limit reached")
 
     def test_reviewed_write_task_can_relay_to_fresh_session_in_same_worktree(self) -> None:
         self._enable_write_backend(["README.txt"])

@@ -68,6 +68,16 @@ def project_config(project_id: str) -> dict:
     limits = config.get("limits", {})
     if not isinstance(limits, dict):
         raise BridgeError("INVALID_CONFIG", "limits must be an object")
+    if any(key not in {"seconds", "wall_seconds", "rounds", "usd"} for key in limits):
+        raise BridgeError("INVALID_CONFIG", "Unknown limits setting")
+    seconds = limits.get("seconds", 3600)
+    wall_seconds = limits.get("wall_seconds", seconds)
+    if type(seconds) is not int or not 1 <= seconds <= 86400:
+        raise BridgeError("INVALID_CONFIG", "limits.seconds must be 1 through 86400")
+    if type(wall_seconds) is not int or not seconds <= wall_seconds <= 86400:
+        raise BridgeError("INVALID_CONFIG", "limits.wall_seconds must be between limits.seconds and 86400")
+    if type(limits.get("rounds", 3)) is not int or not 1 <= limits.get("rounds", 3) <= 10:
+        raise BridgeError("INVALID_CONFIG", "limits.rounds must be 1 through 10")
     context_policy = config.get("context_policy", {})
     if not isinstance(context_policy, dict) or any(
             key not in {"auto_compact_window", "auto_compact_percent"} for key in context_policy):

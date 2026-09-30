@@ -36,12 +36,12 @@ flowchart TD
     EV --> DB
     EV -->|automatic handoff| H[Codex App Server handoff host] --> D[Bound dedicated Codex session]
     D -->|inspect / answer / review / acknowledge| M
-    D -->|reviewed write phase| F[continue_task fresh_session] --> E
+    D -->|reviewed phase or inspected failed write| F[continue_task fresh_session] --> E
     E -->|reuse worktree, start new session| CCW
     EV -->|context overflow| X[Record CONTEXT_LIMIT<br/>retain write worktree, no old-session retry]
 ```
 
-Codex decides which tasks are genuinely independent. The executor checks declared paths, `parallel_ok`, and the per-project limit. Up to three tasks may run by default, but tasks without an explicit parallel declaration remain serial. Each task keeps its own session, events, and usage; write tasks also have separate branches and worktrees. A conflict returns `PROJECT_BUSY`; Codex submits follow-up work only after reviewing the prior result and verifying its Git baseline. Manual mode supports on-demand checks, while automatic handoff wakes the bound Codex session for questions, deliveries, or failures. `watch` waits for program events without repeated model calls. A reviewed write phase can continue in its worktree with a fresh CC session; context overflow retains the worktree without retrying the old session. Review does not merge or push commits.
+Codex decides which tasks are genuinely independent. The executor checks declared paths, `parallel_ok`, and the per-project limit. Up to three tasks may run by default, but tasks without an explicit parallel declaration remain serial. Each task keeps its own session, events, and usage; write tasks also have separate branches and worktrees. A conflict returns `PROJECT_BUSY`; Codex submits follow-up work only after reviewing the prior result and verifying its Git baseline. Manual mode supports on-demand checks, while automatic handoff wakes the bound Codex session for questions, deliveries, or failures. `watch` waits for program events without repeated model calls. A reviewed phase or inspected failed write task can continue in its worktree with a fresh CC session; context overflow retains the worktree without retrying the old session. Review does not merge or push commits.
 
 ## Requirements
 
@@ -69,20 +69,20 @@ Edit the displayed JSON config. Keep it readable only by your user (mode 0600). 
           "shared_context": "CODEX1CC_CONTEXT.md",
           "read_paths": ["README.md", "docs", "src"],
           "model": "your-working-model-id",
-          "limits": {"seconds": 1800, "rounds": 3}
+          "limits": {"seconds": 1800, "wall_seconds": 28800, "rounds": 3}
         }
       }
     }
 
-Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. The configured `seconds` and `rounds` are project caps. A task can lower its time cap; legacy project `limits.usd` is ignored and new task `limits.usd` is rejected.
+Run `init-config` only once; it refuses to overwrite an existing configuration. Keep the JSON file private (`chmod 600 "$(codex1cc config-path)"`). The project ID must contain only ASCII letters, digits, `_`, or `-`, and `root` must be an existing absolute directory. `model` may be omitted if Claude Code's default model works; otherwise use a verified model ID. `limits.seconds` caps CC agent work, while `limits.wall_seconds` caps the whole round. A task can lower either cap, and the wall cap must be at least the agent cap. `rounds` remains the continuation cap. Legacy project `limits.usd` is ignored and new task `limits.usd` is rejected.
 
 Create the shared context file inside the target project before submitting a task. Record authoritative document paths, stable constraints, and reusable public facts; exclude credentials and unverified status claims. Claude receives a fixed copy even if it is not in the requested `scope`. For read-only tasks, selected paths are copied into a private snapshot; symbolic links and special files are rejected. Each task path must exactly match a configured `read_paths` entry: if `docs` is allowed, request `docs`, not an unlisted `docs/file.md`. Exclude generated assets and caches; a read-only snapshot is limited to 20 MiB and 2000 files.
 
 ### Long-running tasks and context protection
 
-For tasks it launches, Codex1CC asks Claude Code to compact earlier: by default, at 70% of an auto-compact window capped at 500000 tokens. Claude Code caps that window at the model's actual context size if smaller. Per-project settings may override this, for example `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`. The allowed window is 100000–1000000 tokens and the percentage is 1–90; actual behavior also depends on the CLI, model, and Claude settings. To allow a task longer than one hour, explicitly raise project `limits.seconds`, up to 86400; each task can only lower that cap. Write long gate output to files and return a conclusion, exit code, and path.
+For tasks it launches, Codex1CC asks Claude Code to compact earlier: by default, at 70% of an auto-compact window capped at 500000 tokens. Claude Code caps that window at the model's actual context size if smaller. Per-project settings may override this, for example `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`. The allowed window is 100000–1000000 tokens and the percentage is 1–90; actual behavior also depends on the CLI, model, and Claude settings. On Linux native-write tasks, `limits.seconds` counts time spent by CC itself. It pauses while a non-bridge descendant command such as a test, build, or gate is running. `limits.wall_seconds` continues counting and stops the whole round at its hard cap. Both default to the same value for backward compatibility and may be set up to 86400 seconds. Write long gate output to files and return a conclusion, exit code, and path.
 
-After a write task delivers a reviewed phase, Codex can check the artifacts and known cumulative cost, then call `continue_task(..., fresh_session=true)` to start a new CC session in the same task worktree without loading the old conversation. If CC still exceeds its context window, the task fails with `CONTEXT_LIMIT` and retains its write worktree. Automatic handoff asks Codex to inspect the evidence. The overflowing session is never retried automatically. Unattended checkpoint and relay remain unimplemented and unvalidated. Claude Code background jobs started outside Codex1CC are not managed by this task mechanism. See the [long-running task plan](docs/long-running-tasks-plan.md).
+After a write task delivers a reviewed phase, Codex can check the artifacts and known cumulative cost, then call `continue_task(..., fresh_session=true)` to start a new CC session in the same task worktree without loading the old conversation. The same relay is available after a failed write task only when Codex has explicitly inspected its retained diff, commits, scope, and test evidence; the continuation instruction must state what is verified and what remains. If CC still exceeds its context window, the task fails with `CONTEXT_LIMIT` and retains its write worktree. Automatic handoff asks Codex to inspect the evidence. The failed or overflowing session is never retried automatically. Unattended checkpoint and relay remain unimplemented and unvalidated. Claude Code background jobs started outside Codex1CC are not managed by this task mechanism. See the [long-running task plan](docs/long-running-tasks-plan.md).
 
 ### Optional native CC editing (experimental)
 
@@ -90,7 +90,7 @@ For a Git repository you trust, add `"write_backend": {"enabled": true, "write_p
 
 > Use $codex1cc-ops to delegate this complete development task in demo to CC with read, write, and test execution. Limit changed paths to `src` and `tests`, use automatic handoff, and review the actual diff, commits, and test evidence when CC finishes. Submit once; do not poll or retry automatically.
 
-The result includes the worktree, base and final commits, dirty state, and paths changed outside the declared scope. CC's Bash access can reach local files and networks; `write_paths` and `scope` are admission and review rules, not a hard sandbox. Use this only with projects and environments you trust. Canceled and failed tasks preserve their worktree for review. After a CLI failure, Codex may explicitly accept valid work after checking the evidence; the original failure reason stays recorded. Existing Claude background sessions are not adopted.
+The result includes the worktree, base and final commits, dirty state, and paths changed outside the declared scope. CC's Bash access can reach local files and networks; `write_paths` and `scope` are admission and review rules, not a hard sandbox. Use this only with projects and environments you trust. Canceled and failed tasks preserve their worktree for review. After a CLI failure, Codex may explicitly accept valid work or continue an incomplete write task with a fresh CC session after checking the evidence; the original failed session is not resumed. Existing Claude background sessions are not adopted.
 
 Run diagnostics:
 
@@ -254,7 +254,7 @@ See the [validation record](docs/validation.md) for the tested versions and rema
 
 - **SANDBOX_UNAVAILABLE:** Install bubblewrap on Linux and confirm unprivileged namespaces are permitted. On macOS, the isolation backend is not implemented yet.
 - **PROJECT_NOT_ALLOWED:** Check that the project ID exists, every task scope entry exactly matches a configured project-relative `read_paths` entry, and the shared file exists. Symlinks and special files are rejected.
-- **LIMIT_REACHED:** Narrow the scope, or check the configured time, round, and snapshot limits.
+- **LIMIT_REACHED:** Narrow the scope, or check the configured agent time (`seconds`), hard wall time (`wall_seconds`), round, and snapshot limits.
 - **HANDOFF_UNAVAILABLE:** Check the managed App Server, `codex1cc doctor`, and the bound resumable session.
 - **CLI_FAILED:** Run codex1cc doctor, then check your Claude Code authentication, endpoint and model ID. A model rejected by its service is not a Codex1CC task success.
 - **Task interrupted:** The executor restarted while a round was active. Review the snapshot and recorded events; it never replays an uncertain round automatically.

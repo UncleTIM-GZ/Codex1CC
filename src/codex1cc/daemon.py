@@ -452,9 +452,14 @@ class Executor:
         if not isinstance(limits, dict):
             raise BridgeError("INVALID_ARGUMENT", "limits must be an object")
         configured_max = self._number(project.get("limits", {}).get("seconds", 3600), 1, 86400)
+        configured_wall = self._number(
+            project.get("limits", {}).get("wall_seconds", configured_max), 1, 86400)
         max_seconds = self._number(limits.get("seconds", configured_max), 1, 86400)
-        if max_seconds > configured_max:
+        wall_seconds = self._number(limits.get("wall_seconds", configured_wall), 1, 86400)
+        if max_seconds > configured_max or wall_seconds > configured_wall:
             raise BridgeError("LIMIT_REACHED", "Task time exceeds project limit")
+        if wall_seconds < max_seconds:
+            raise BridgeError("INVALID_ARGUMENT", "limits.wall_seconds must be at least limits.seconds")
         if "usd" in limits:
             raise BridgeError("INVALID_ARGUMENT", "CC cost is not a task limit; omit limits.usd")
         max_rounds = self._number(project.get("limits", {}).get("rounds", 3), 1, 10)
@@ -491,7 +496,8 @@ class Executor:
                   "parallel_ok": parallel_ok,
                   "task_id": task_id,
                   "backend": "native_write" if write_task else "read_only", "workspace": workspace,
-                  "limits": {"seconds": max_seconds, "rounds": max_rounds},
+                  "limits": {"seconds": max_seconds, "wall_seconds": wall_seconds,
+                             "rounds": max_rounds},
                   "question_policy": question_policy,
                   "shared_context": project["shared_context"], "snapshot_sha256": digest,
                   "snapshot_info": snapshot_info, "handoff": binding}
@@ -529,16 +535,32 @@ class Executor:
         fresh_session = params.get("fresh_session", False)
         if type(fresh_session) is not bool:
             raise BridgeError("INVALID_ARGUMENT", "fresh_session must be boolean")
+        failed_write = (item["status"] == "failed" and
+                        item["bundle"].get("backend") == "native_write")
         resumable = item["status"] == "review_required" or (
             item["status"] == "interrupted" and item["bundle"].get("backend") == "native_write"
-            and item["exit_reason"] == "daemon_restart")
-        if not resumable or not item["session_id"]:
+            and item["exit_reason"] == "daemon_restart") or (failed_write and fresh_session)
+        if not resumable or (not fresh_session and not item["session_id"]):
             raise BridgeError("INVALID_STATE", "Task cannot be resumed")
-        if fresh_session and (item["status"] != "review_required" or
+        if fresh_session and (item["status"] not in {"review_required", "failed"} or
                               item["bundle"].get("backend") != "native_write"):
-            raise BridgeError("INVALID_STATE", "Fresh-session relay requires a reviewed write task")
+            raise BridgeError("INVALID_STATE", "Fresh-session relay requires an inspected write task")
         if item["bundle"].get("backend") == "native_write":
             verify_worktree(item["project"]["root"], item["bundle"]["workspace"])
+        if (fresh_session and item["bundle"].get("backend") == "native_write" and
+                "wall_seconds" not in item["bundle"]["limits"]):
+            current_limits = project_config(item["project_id"]).get("limits", {})
+            if "wall_seconds" in current_limits:
+                wall_seconds = self._number(current_limits["wall_seconds"], 1, 86400)
+                if wall_seconds < item["bundle"]["limits"]["seconds"]:
+                    raise BridgeError("INVALID_CONFIG",
+                                      "Project wall time is below the task agent time")
+                item["bundle"]["limits"]["wall_seconds"] = wall_seconds
+                self.store.update(item["id"], bundle_json=json.dumps(
+                    item["bundle"], ensure_ascii=False))
+                self.store.event(item["id"], "limits_upgraded", {
+                    "seconds": item["bundle"]["limits"]["seconds"],
+                    "wall_seconds": wall_seconds})
         if item["round_no"] >= item["bundle"]["limits"]["rounds"]:
             raise BridgeError("LIMIT_REACHED", "Task round limit reached")
         instruction = self._text(params.get("instruction"), "instruction")
@@ -660,7 +682,14 @@ class Executor:
             try:
                 await asyncio.wait_for(proc.wait(), 5)
             except asyncio.TimeoutError:
-                os.killpg(proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    # The process can exit after wait_for times out but before
+                    # the escalation signal is sent. That is a successful stop,
+                    # not a new CLI failure that should replace the task's
+                    # original LIMIT_REACHED or cancellation reason.
+                    return
                 await proc.wait()
 
     async def run_task(self, task_id: str, instruction: str | None = None,
@@ -742,7 +771,9 @@ class Executor:
                               process_id=proc.pid)
             self.store.event(task_id, "running", {"round_no": max(1, item["round_no"])})
             active_elapsed = 0.0
+            wall_elapsed = 0.0
             last_tick = time.monotonic()
+            external_running = False
             result = None
             last_error = None
             while True:
@@ -752,10 +783,22 @@ class Executor:
                     line = None
                 now = time.monotonic()
                 if self.store.one(task_id)["status"] != "waiting_answer":
-                    active_elapsed += now - last_tick
+                    tick = now - last_tick
+                    wall_elapsed += tick
+                    observed_external = write_task and self._external_command_running(proc.pid)
+                    if observed_external != external_running:
+                        external_running = observed_external
+                        self.store.event(task_id, "external_command", {"running": external_running})
+                    if not external_running:
+                        active_elapsed += tick
                 last_tick = now
+                wall_limit = bundle["limits"].get("wall_seconds", bundle["limits"]["seconds"])
+                if wall_elapsed >= wall_limit:
+                    self._fail(task_id, "LIMIT_REACHED", "Task hard wall time limit reached")
+                    await self._stop_process(task_id)
+                    return
                 if active_elapsed >= bundle["limits"]["seconds"]:
-                    self._fail(task_id, "LIMIT_REACHED", "Task time limit reached")
+                    self._fail(task_id, "LIMIT_REACHED", "CC agent work time limit reached")
                     await self._stop_process(task_id)
                     return
                 if line is None:
@@ -868,6 +911,44 @@ class Executor:
             "prompt is too long", "too many tokens in prompt"))
 
     @staticmethod
+    def _external_command_running(root_pid: int) -> bool:
+        """Return whether Claude currently has a non-bridge descendant process."""
+        if not sys.platform.startswith("linux"):
+            return False
+        processes: dict[int, tuple[int, str, str]] = {}
+        try:
+            entries = Path("/proc").iterdir()
+        except OSError:
+            return False
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat_line = (entry / "stat").read_text()
+                _, _, tail = stat_line.rpartition(")")
+                fields = tail.strip().split()
+                state, parent = fields[0], int(fields[1])
+                command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                    errors="replace")
+                processes[int(entry.name)] = (parent, state, command)
+            except (OSError, ValueError, IndexError):
+                continue
+        descendants = {root_pid}
+        changed = True
+        while changed:
+            changed = False
+            for pid, (parent, _, _) in processes.items():
+                if parent in descendants and pid not in descendants:
+                    descendants.add(pid)
+                    changed = True
+        for pid in descendants - {root_pid}:
+            _, state, command = processes[pid]
+            if state == "Z" or "codex1cc.question_server" in command:
+                continue
+            return True
+        return False
+
+    @staticmethod
     async def _collect_stderr(stream: asyncio.StreamReader) -> str:
         chunks = []
         size = 0
@@ -880,7 +961,7 @@ class Executor:
     def _fail(self, task_id: str, code: str, message: str) -> None:
         self.jobs.pop(task_id, None)
         item = self.store.one(task_id)
-        if item["status"] in {"canceled", "review_required", "completed"}:
+        if item["status"] in {"canceled", "review_required", "completed", "failed"}:
             return
         safe_message = scrub(message[:2000])
         summary = {"conclusion": safe_message}

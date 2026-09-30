@@ -3,7 +3,7 @@
 ## 已实现：提前压缩与可判读的停机
 
 1. 项目可配置 `context_policy.auto_compact_window`（100000–1000000 token）和 `auto_compact_percent`（1–90）；默认分别为 500000 和 70。执行器为自己启动的 CC 进程传入 Claude Code 官方自动压缩环境变量。实际压缩由 CLI 完成，Codex1CC 不伪装能从外部执行 `/compact`。
-2. `limits.seconds` 默认 3600，可由项目明确提高至 86400；任务只能使用不高于项目配置的值。轮数上限仍生效，CC 不使用 USD 限额。
+2. 双计时限制：`limits.seconds` 默认 3600，只累计 CC 自身工作时间；Linux 原生写入任务有测试、构建或门禁子进程运行时暂停。`limits.wall_seconds` 始终累计，默认与 `seconds` 相同，项目可明确提高至 86400。任务只能降低项目配置，轮数上限仍生效，CC 不使用 USD 限额。
 3. 将可识别的上下文超限错误归类为 `CONTEXT_LIMIT`；保留任务事件、失败原因和写入工作树，经原有自动接管交给 Codex。不得对同一超限会话盲重试或假定失败调用费用为零。
 4. 对已正常交付、处于 `review_required` 的写入任务开放 `continue_task(..., fresh_session=true)`。Codex 核查阶段结果和工作树后，执行器在同一工作树启动新 CC 会话，不传旧 `--resume`；原目标和新指令仍受原权限、时间及轮数上限约束。
 

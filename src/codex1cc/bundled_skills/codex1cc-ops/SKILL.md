@@ -77,8 +77,11 @@ Call `list_tasks` once for active statuses before submission. Do not submit a
 duplicate. Build one cohesive task with the complete objective, relevant public
 context, measurable acceptance criteria, expected deliverables, exact authorized
 scope, time and round limits, and question policy. Do not set or negotiate a CC
-USD limit; cost is optional usage telemetry, not an approval gate. Keep linked small steps together. Split work
-only when tasks are truly independent. The default project limit is 3; for
+USD limit; cost is optional usage telemetry, not an approval gate. For Linux
+write tasks, `limits.seconds` counts CC agent work and pauses while an external
+test/build/gate descendant is running; `limits.wall_seconds` is the whole-round
+hard cap. Do not describe either limit as a cost budget. Keep linked small steps
+together. Split work only when tasks are truly independent. The default project limit is 3; for
 parallel work in one project, require an effective `parallel.max_agents > 1`
 and explicit authorization that the tasks are
 independent. Inspect each active task's scope with `get_task` as needed. Set
@@ -112,9 +115,14 @@ When Codex1CC delivers a question, result, failure, or interruption:
    outside-scope report, and test evidence. Treat CC's claims as unverified.
    Review evidence before `complete_task`. Use `continue_task` only for a
    concrete gap inside the original authorization. Never automatically retry a
-   failed or interrupted task. A failed write task may contain valid work:
-   after checking the diff, commits, and acceptance evidence, `complete_task`
-   may explicitly accept it while retaining the original failure reason.
+   failed or interrupted task. A failed write task may contain valid work. After
+   checking the diff, commits, scope, and test evidence, use
+   `continue_task(..., fresh_session=true)` to let a new CC session finish the
+   retained work in the same worktree. Give it an exact instruction naming the
+   verified work, remaining gaps, and required tests. Do not resume the failed
+   CC session. If the retained result already satisfies acceptance,
+   `complete_task` may explicitly accept it while retaining the original failure
+   reason.
    Keep the worktree until the user explicitly
    requests cleanup; do not merge, push, or deploy on task completion alone.
    When a reviewed write task has a documented next phase, use
@@ -141,11 +149,10 @@ the original turn and its effects are verified; otherwise leave it for user
 review.
 
 On `CONTEXT_LIMIT`, inspect the retained task worktree, commits, changed files,
-and test logs. Do not resume or retry the overflowing Claude session. A
-fresh-session relay is available only after a write task has normally reached
-`review_required` and its work has been reviewed. A failed task needs an
-explicit review and a new scoped task on a
-verified Git baseline; do not silently restart it. Do not claim to manage Claude
+and test logs. Do not resume or retry the overflowing Claude session. After an
+explicit review, a failed write task can use a fresh-session relay in its
+retained worktree. Do not silently restart it. Read-only failures still require
+a new scoped task on a verified baseline. Do not claim to manage Claude
 background jobs that were started outside Codex1CC.
 
 Do not expose receipt tokens, configuration contents, credentials, private
