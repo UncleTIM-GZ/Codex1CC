@@ -57,6 +57,7 @@ class GoalWaitTest(unittest.IsolatedAsyncioTestCase):
             executor = Executor.__new__(Executor)
             executor.store = store
             executor.activity_changed = mock.Mock()
+            executor.stopping = False
             executor.activity_changed.wait = mock.AsyncMock(return_value=True)
             clock = mock.Mock()
             clock.monotonic.side_effect = iter(range(50))

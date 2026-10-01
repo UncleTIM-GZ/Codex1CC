@@ -165,6 +165,9 @@ class _Connection:
                 if not isinstance(message, dict):
                     continue
                 if isinstance(message.get("id"), int) and isinstance(message.get("method"), str):
+                    target = (message.get("params") or {}).get("threadId")
+                    if target and target != self.approval_context.get("thread_id"):
+                        continue  # Another connection owns that thread's interactive requests.
                     approved = self._allowed_approval(message)
                     if message["method"] == "mcpServer/elicitation/request":
                         answer = {"id": message["id"], "result": {
@@ -256,12 +259,16 @@ class AppServerHost:
     async def _socket_path(self) -> str:
         if self.socket_path is not None:
             return self.socket_path
+        process = None
         try:
             process = await asyncio.create_subprocess_exec(
                 *self.command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             raw, _ = await asyncio.wait_for(process.communicate(), 5)
             report = json.loads(raw)
         except (OSError, asyncio.TimeoutError, ValueError) as exc:
+            if process and process.returncode is None:
+                process.kill()
+                await process.wait()
             raise HostError(f"Cannot inspect managed Codex App Server: {exc}") from exc
         if process.returncode or report.get("status") != "running":
             raise HostError("Managed Codex App Server is not running")

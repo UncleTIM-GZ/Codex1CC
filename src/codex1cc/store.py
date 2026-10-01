@@ -55,6 +55,9 @@ class Store:
         if path.is_symlink():
             raise BridgeError("INVALID_CONFIG", "State database must not be a symbolic link")
         self.db = sqlite3.connect(path)
+        if self.db.execute("PRAGMA user_version").fetchone()[0] > 4:
+            self.db.close()
+            raise BridgeError("INVALID_STATE", "Database was created by a newer executor; upgrade the package")
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -282,6 +285,9 @@ class Store:
             keys = list(fields)
             self.db.execute(f"UPDATE tasks SET {', '.join(k + '=?' for k in keys)} WHERE id=?",
                             [fields[k] for k in keys] + [task_id])
+            if fields.get("status") in {"failed", "interrupted", "canceled", "completed", "review_required"}:
+                self.db.execute("UPDATE questions SET status='expired' WHERE task_id=? AND status='pending'",
+                                (task_id,))
             goal_status = {"completed": "completed", "canceled": "canceled",
                            "continuing": "active"}.get(fields.get("status"))
             if goal_status:
@@ -351,7 +357,8 @@ class Store:
 
     def handoff_busy_threads(self) -> set[str]:
         rows = self.db.execute("""SELECT * FROM handoff_events
-            WHERE status IN ('accepted','sending','needs_reconcile')""").fetchall()
+            WHERE status IN ('accepted','sending','needs_reconcile')
+            OR (status='handled' AND turn_id IS NOT NULL AND codex_status IS NULL)""").fetchall()
         return {self._handoff_row(row)["binding"].get("thread_id", "") for row in rows}
 
     def handoff_started_count(self, task_id: str) -> int:
@@ -435,11 +442,13 @@ class Store:
     def handoff_flag(self, event_id: str, reason: str) -> None:
         with self.db:
             changed = self.db.execute("""UPDATE handoff_events SET status='needs_reconcile',error=?,updated_at=?
-                WHERE id=? AND status IN ('pending','sending','accepted')""",
+                WHERE id=? AND (status IN ('pending','sending','accepted')
+                    OR (status='handled' AND turn_id IS NOT NULL AND codex_status IS NULL))""",
                 (str(scrub(reason))[:500], time.time(), event_id))
         if changed.rowcount:
             task_id = self.handoff_one(event_id)["task_id"]
             self.event(task_id, "handoff_attention", {"event_id": event_id, "reason": reason})
+            self.notify(task_id, "Codex1CC · needs reconciliation", reason)
 
     def handoff_record_turn(self, event_id: str, status: str, result: str | None) -> None:
         previous = self.handoff_one(event_id)
@@ -534,22 +543,47 @@ class Store:
             bundle = json.loads(row["bundle_json"] or "{}")
             workspace = bundle.get("workspace") or {}
             reason = "daemon_restart"
-            if pid and os.name == "posix" and Path(f"/proc/{pid}/cmdline").exists():
+            if pid and not Path("/proc").is_dir():
+                reason = "daemon_restart_unverified_process"
+            elif pid and Path(f"/proc/{pid}/cmdline").exists():
                 try:
                     command = Path(f"/proc/{pid}/cmdline").read_bytes()
                     cwd = Path(f"/proc/{pid}/cwd").resolve()
                     if (row["id"].encode() in command or
                             (workspace and cwd == Path(workspace["worktree_path"]).resolve()
                              and b"claude" in command)):
-                        os.killpg(pid, signal.SIGTERM)
+                        # Recovery must not publish a resumable worktree while an old
+                        # writer is alive. The daemon no longer owns its pipes, so kill
+                        # only this verified process group and confirm it has stopped.
+                        os.killpg(pid, signal.SIGKILL)
+                        deadline = time.monotonic() + 2
+                        while self._group_alive(pid) and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        if self._group_alive(pid):
+                            reason = "daemon_restart_unverified_process"
                     else:
                         reason = "daemon_restart_unverified_process"
                 except (OSError, ProcessLookupError):
                     reason = "daemon_restart_unverified_process"
+            elif pid and self._group_alive(pid):
+                reason = "daemon_restart_unverified_process"
             self.transition(row["id"], "interrupted", {"reason": reason, "review_required": True},
                             status="interrupted", exit_reason=reason, process_id=None)
         self.db.execute("UPDATE questions SET status='expired' WHERE status='pending'")
         self.db.commit()
+
+    @staticmethod
+    def _group_alive(group_id: int) -> bool:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                fields = (entry / "stat").read_text().rpartition(")")[2].split()
+                if int(fields[2]) == group_id and fields[0] != "Z":
+                    return True
+            except (OSError, ValueError, IndexError):
+                continue
+        return False
 
     def queued(self) -> list[dict]:
         return [dict(r) for r in self.db.execute("SELECT id,project_id FROM tasks WHERE status='queued' ORDER BY created_at")]
@@ -562,7 +596,8 @@ class Store:
     def active(self, project_id: str, exclude: str | None = None) -> list[dict]:
         rows = self.db.execute(
             "SELECT id,status,bundle_json FROM tasks WHERE project_id=? "
-            "AND status IN ('queued','running','waiting_answer','continuing') AND id!=? "
+            "AND (status IN ('queued','running','waiting_answer','continuing') "
+            "OR EXISTS (SELECT 1 FROM goals WHERE goals.task_id=tasks.id AND goals.status='active')) AND id!=? "
             "ORDER BY created_at",
             (project_id, exclude or "")).fetchall()
         return [{"id": row["id"], "status": row["status"],

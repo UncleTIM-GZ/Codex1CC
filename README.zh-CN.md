@@ -1,5 +1,7 @@
 # Codex1CC 使用说明
 
+[2026-10-01 可靠性审计](docs/reliability-audit-2026-10-01.md)记录了生命周期修复、故障注入验证和剩余发布门禁。当前自动修复面向有上限的单个目标；通用跨任务集成和生产发布编排尚未实现。
+
 [English README](README.md) · [产品需求文档](Codex1CC%20产品需求文档.md) · [验证记录](docs/validation.md)
 
 Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 CC），由 Codex 检查结果。默认任务只读取你授权的项目文件；显式启用写入后端后，CC 可在独立 Git worktree 中编码、测试和创建本地提交。即使关闭 Codex 对话，任务记录仍保存在运行工具的电脑上。

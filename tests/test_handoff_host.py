@@ -28,6 +28,7 @@ class ProtocolPeer:
         self.approval_received = asyncio.Event()
         self.approval_during_start = False
         self.foreign_unload = False
+        self.foreign_approval = False
 
     def approval_request(self, ident):
         return {"id": ident, "method": "mcpServer/elicitation/request",
@@ -66,6 +67,10 @@ class ProtocolPeer:
                         thread["turns"] = list(self.turns)
                     result = {"thread": thread}
                 elif method == "thread/resume":
+                    if self.foreign_approval:
+                        request = self.approval_request(9010)
+                        request["params"]["threadId"] = "unrelated-thread"
+                        await socket.send(json.dumps(request))
                     if self.foreign_unload:
                         await socket.send(json.dumps({"method": "thread/status/changed", "params": {
                             "threadId": "unrelated-thread", "status": {"type": "notLoaded"}}}))
@@ -159,6 +164,13 @@ class HandoffHostTests(unittest.IsolatedAsyncioTestCase):
         started = await self.host.deliver(self.binding, "event-foreign", "Inspect the task")
         result = await self.host.wait_for_turn(self.binding, started.turn_id, timeout=2)
         self.assertEqual(result.status, "completed")
+
+    async def test_foreign_thread_approval_is_not_declined_by_this_controller(self):
+        self.peer.foreign_approval = True
+        started = await self.host.deliver(self.binding, "event-foreign-approval", "Inspect the task")
+        result = await self.host.wait_for_turn(self.binding, started.turn_id, timeout=2)
+        self.assertEqual(result.status, "completed")
+        self.assertIsNone(self.peer.approval_response)
 
     async def test_approval_is_scoped_to_current_task_even_before_waiter_attaches(self):
         self.peer.approval_tool = "get_task"

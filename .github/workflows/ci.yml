@@ -6,6 +6,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 15
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -18,3 +19,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e .
       - run: python -m unittest discover -s tests -v
+      - name: Verify a clean wheel installation
+        shell: bash
+        run: |
+          python -m pip wheel --no-deps --wheel-dir /tmp/codex1cc-wheel .
+          python -m venv /tmp/codex1cc-wheel-env
+          /tmp/codex1cc-wheel-env/bin/python -m pip install /tmp/codex1cc-wheel/*.whl
+          /tmp/codex1cc-wheel-env/bin/python -I tests/smoke_installed.py

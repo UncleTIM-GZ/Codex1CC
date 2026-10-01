@@ -6,6 +6,8 @@ Install Codex1CC where it can access your project files and Claude Code. Codex c
 
 **Status: alpha.** The Linux read-only runner and automatic handoff have each passed a small real task. The native write backend passed fake-CLI tests and a real two-round repair with automatic Codex scope replanning, a CC question answered by Codex, local commits, and final acceptance in a temporary project. See the [autonomous validation record](docs/autonomous-validation.md). Cross-machine acceptance remains open. Write mode runs commands in a trusted project and is not a filesystem or network sandbox.
 
+The [2026-10-01 reliability audit](docs/reliability-audit-2026-10-01.md) documents lifecycle repairs, failure-injection coverage, and remaining release gates. Autonomous repair currently covers one bounded goal; general cross-task integration and production release orchestration remain outside that capability.
+
 **中文完整说明：**[安装、项目初始化、指挥 CC、跨会话验收与注意事项](README.zh-CN.md)。
 
 Licensed under MIT; see [LICENSE](LICENSE).

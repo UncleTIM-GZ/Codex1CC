@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 
-from .common import BridgeError, MAX_LINE, SOCKET, STATE, atomic_json, private_dir, projects, safe_id
+from .common import BridgeError, MAX_LINE, SOCKET, STATE, atomic_json, executor_lock, private_dir, projects, safe_id
 from .auth import provider_environment
 from .policy import project_config, snapshot
 from .sandbox import linux_available, wrap_linux
@@ -33,10 +33,12 @@ class Executor:
         self.jobs: dict[str, asyncio.Task] = {}
         self.answers: dict[str, asyncio.Future] = {}
         self.stopping = False
+        self.instance_id = uuid.uuid4().hex
         self.shutdown_event = shutdown_event
         self.handoff_changed = asyncio.Event()
         self.activity_changed = asyncio.Event()
         self.notification_changed = asyncio.Event()
+        self.service_health: dict[str, dict] = {}
         self.store.mark_interrupted()
         self.store.prune_terminal_history()
         self.store.on_event = self._changed
@@ -45,6 +47,24 @@ class Executor:
         self.activity_changed.set()
         self.handoff_changed.set()
         self.notification_changed.set()
+
+    async def supervise(self, name: str, factory) -> None:
+        """Keep transport failures visible and restart only program supervision."""
+        while not self.stopping:
+            try:
+                self.service_health[name] = {"status": "running"}
+                await factory()
+                if not self.stopping:
+                    raise RuntimeError("Service loop stopped unexpectedly")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                reason = str(scrub(str(exc)))[:500]
+                self.service_health[name] = {"status": "retrying", "error": reason}
+                rows = self.store.db.execute("SELECT task_id FROM goals WHERE status='active'").fetchall()
+                for row in rows:
+                    self.store.notify(row["task_id"], "Codex1CC · " + name + " interrupted", reason)
+                await asyncio.sleep(30)
 
     async def notification_loop(self) -> None:
         from .notifications import deliver_notification
@@ -65,6 +85,8 @@ class Executor:
             await self.notification_changed.wait()
 
     async def dispatch(self, method: str, params: dict) -> dict:
+        if self.stopping and method not in {"doctor", "get_task", "list_tasks", "notifications"}:
+            raise BridgeError("DAEMON_UNAVAILABLE", "Executor is shutting down")
         if method == "submit_task":
             return await self.submit(params)
         if method == "list_tasks":
@@ -149,9 +171,14 @@ class Executor:
             active = self.store.list_tasks(None, ["queued", "running", "waiting_answer", "continuing"], 0, 1)
             if active:
                 raise BridgeError("INVALID_STATE", "Cancel active tasks before stopping the executor")
+            if (any(not job.done() for job in self.jobs.values()) or
+                    self.store.handoff_sending() or self.store.handoff_accepted() or
+                    self.store.handoff_unrecorded()):
+                raise BridgeError("INVALID_STATE", "Worker cleanup or Codex controller is still active")
+            self.stopping = True
             if self.shutdown_event:
                 self.shutdown_event.set()
-            return {"stopping": True}
+            return {"stopping": True, "instance_id": self.instance_id}
         raise BridgeError("INVALID_ARGUMENT", f"Unknown method: {method}")
 
     @staticmethod
@@ -212,9 +239,8 @@ class Executor:
                 outcome in {"failed", "reviewed", "needs_user"}):
             raise BridgeError("INVALID_STATE", "Goal is still active. Continue verified work, complete acceptance, "
                               "or manage_goal with a concrete blocked/needs_user reason before acknowledging")
-        expected = {"completed": "completed", "continued": "continuing"}
-        if outcome in expected and task["status"] != expected[outcome] and not (
-                outcome == "continued" and (task["status"] == "running" or task["round_no"] > event["round_no"])):
+        if ((outcome == "completed" and task["status"] != "completed") or
+                (outcome == "continued" and task["round_no"] <= event["round_no"])):
             raise BridgeError("INVALID_STATE", "Task state does not match handoff outcome")
         if outcome == "answered" and (event["kind"] not in {"question", "goal_recovery"} or
                                       not event["summary"].get("question_id")):
@@ -297,6 +323,8 @@ class Executor:
 
     @staticmethod
     def _handoff_current(event: dict, task: dict) -> bool:
+        if event["round_no"] != task["round_no"]:
+            return False
         kind, status = event["kind"], task["status"]
         if kind == "question":
             return status == "waiting_answer"
@@ -358,8 +386,10 @@ class Executor:
                     self.store.handoff_accept(event["id"], found.turn_id)
                     if found.status == "inProgress":
                         watch(event["id"], scoped_binding(event), found.turn_id)
-                    elif self.store.handoff_one(event["id"])["status"] == "accepted":
-                        self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
+                    else:
+                        self.store.handoff_record_turn(event["id"], found.status, found.result)
+                        if self.store.handoff_one(event["id"])["status"] == "accepted":
+                            self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
                 else:
                     self.store.handoff_flag(event["id"], f"Uncertain delivery: {reason}")
             except Exception as exc:
@@ -380,6 +410,9 @@ class Executor:
                         except Exception:
                             pass
                     if delivery.status in {"completed", "failed", "interrupted", "unknown"}:
+                        if delivery.status == "unknown":
+                            self.store.handoff_flag(event_id, "Codex turn outcome is uncertain: " +
+                                                   (delivery.error or "unknown"))
                         self.store.handoff_record_turn(event_id, delivery.status, delivery.result)
                         self.store.event(self.store.handoff_one(event_id)["task_id"], "codex_handoff_result",
                                          {"event_id": event_id, "status": delivery.status,
@@ -388,13 +421,12 @@ class Executor:
                             self.store.handoff_flag(event_id, "Codex handling receipt missing: " +
                                                    (delivery.error or delivery.status))
                             self.handoff_changed.set()
-                    elif delivery.status == "inProgress" and self.store.handoff_one(event_id)["status"] == "accepted":
+                    elif delivery.status == "inProgress":
                         self.store.handoff_flag(event_id, "Codex turn remained active after the time limit")
                         self.handoff_changed.set()
                 except Exception as exc:
-                    if self.store.handoff_one(event_id)["status"] == "accepted":
-                        self.store.handoff_flag(event_id, f"Cannot observe Codex turn: {exc}")
-                        self.handoff_changed.set()
+                    self.store.handoff_flag(event_id, f"Cannot observe Codex turn: {exc}")
+                    self.handoff_changed.set()
 
             job = asyncio.create_task(run())
             watchers.add(job)
@@ -414,120 +446,132 @@ class Executor:
             watchers.add(job)
             job.add_done_callback(watchers.discard)
 
-        for event in self.store.handoff_sending():
-            await reconcile_uncertain(event, "Executor restarted during handoff delivery")
+        try:
+            for event in self.store.handoff_sending():
+                await reconcile_uncertain(event, "Executor restarted during handoff delivery")
 
-        for event in self.store.handoff_accepted():
-            try:
-                delivery = await host.reconcile(event["binding"], event["turn_id"])
-                if delivery.status in {"completed", "failed", "interrupted"}:
-                    self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
-                    if self.store.handoff_one(event["id"])["status"] == "accepted":
-                        self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
-                elif delivery.status == "unknown":
-                    self.store.handoff_flag(event["id"], "Unable to reconcile prior Codex turn")
-                else:
-                    watch(event["id"], scoped_binding(event), event["turn_id"])
-            except Exception as exc:
-                self.store.handoff_flag(event["id"], f"Unable to reconcile prior Codex turn: {exc}")
-        for event in self.store.handoff_unrecorded():
-            try:
-                delivery = await host.reconcile(event["binding"], event["turn_id"])
-                if delivery.status in {"completed", "failed", "interrupted"}:
-                    self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
-            except Exception:
-                pass
-        while not self.stopping:
-            self.recover_goals()
-            ready = self.store.handoff_ready()
-            busy = self.store.handoff_busy_threads()
-            processed = False
-            for event in ready:
-                thread_id = event["binding"].get("thread_id", "")
-                if thread_id in busy:
-                    continue
-                task = self.store.one(event["task_id"])
+            for event in self.store.handoff_accepted():
                 try:
-                    current_binding = projects().get(task["project_id"], {}).get("handoff")
-                except BridgeError as exc:
-                    self.store.handoff_defer(event["id"], str(exc), 30)
-                    processed = True
-                    continue
-                if (not isinstance(current_binding, dict) or current_binding.get("mode") != "automatic"
-                        or current_binding.get("thread_id") != thread_id):
-                    self.store.handoff_suspend_project(task["project_id"])
-                    self.store.event(event["task_id"], "handoff_disabled",
-                                     {"event_id": event["id"], "reason": "Project binding changed"})
-                    processed = True
-                    if task.get("goal") and task["goal"]["status"] == "active":
-                        self.store.set_goal(task["id"], "blocked", "Automatic project binding changed or was removed")
-                    continue
-                max_turns = min(event["binding"].get("max_turns", 3),
-                                current_binding.get("max_turns", 3))
-                if self.store.handoff_started_count(event["task_id"]) >= max_turns:
-                    self.store.handoff_stop(event["id"], "Codex handoff turn limit reached")
-                    self.store.event(event["task_id"], "handoff_disabled",
-                                     {"event_id": event["id"], "reason": "Codex handoff turn limit reached"})
-                    processed = True
-                    if task.get("goal") and task["goal"]["status"] == "active":
-                        self.store.set_goal(task["id"], "blocked", "Codex handoff turn limit reached")
-                    continue
-                if task.get("goal") and task["goal"]["status"] != "active":
-                    self.store.handoff_supersede(event["id"])
-                    processed = True
-                    continue
-                question_pending = (event["kind"] != "question" or any(
-                    q["id"] == event["summary"].get("question_id")
-                    for q in self.store.pending_questions(event["task_id"])))
-                if not self._handoff_current(event, task) or not question_pending:
-                    self.store.handoff_supersede(event["id"])
-                    processed = True
-                    continue
-                try:
-                    capability = await host.probe(event["binding"])
-                    if not capability.connected:
-                        self.store.handoff_defer(event["id"], capability.reason or "Codex host unavailable", 30)
-                        processed = True
-                        continue
-                    if not self.store.handoff_begin(event["id"]):
-                        processed = True
-                        continue
-                    delivery = await host.deliver(scoped_binding(event), event["id"],
-                                                  self._handoff_prompt(event))
-                    if delivery.turn_id:
-                        self.store.handoff_accept(event["id"], delivery.turn_id)
-                        self.store.event(event["task_id"], "handoff_accepted",
-                                         {"event_id": event["id"], "turn_id": delivery.turn_id})
-                        busy.add(thread_id)
-                        if delivery.status == "inProgress":
-                            effective = {**scoped_binding(event), "turn_seconds": min(
-                                event["binding"].get("turn_seconds", 600),
-                                current_binding.get("turn_seconds", 600))}
-                            watch(event["id"], effective, delivery.turn_id)
-                        else:
-                            self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
-                            if self.store.handoff_one(event["id"])["status"] == "accepted":
-                                self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
-                    elif delivery.status == "busy":
-                        self.store.handoff_defer(event["id"], "Codex session is busy", 3600)
-                        watch_idle(event["id"], event["binding"])
+                    delivery = await host.reconcile(event["binding"], event["turn_id"])
+                    if delivery.status in {"completed", "failed", "interrupted"}:
+                        self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
+                        if self.store.handoff_one(event["id"])["status"] == "accepted":
+                            self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
+                    elif delivery.status == "unknown":
+                        self.store.handoff_flag(event["id"], "Unable to reconcile prior Codex turn")
                     else:
-                        if delivery.status == "unknown":
-                            await reconcile_uncertain(event, delivery.error or "unknown result")
-                        else:
-                            self.store.handoff_retry(event["id"], delivery.error or delivery.status)
+                        watch(event["id"], scoped_binding(event), event["turn_id"])
                 except Exception as exc:
-                    await reconcile_uncertain(event, str(exc))
-                processed = True
-            if processed:
-                continue
-            due = self.store.handoff_next_due()
-            timeout = min(30, max(0.1, due - time.time())) if due is not None else 30
-            self.handoff_changed.clear()
-            try:
-                await asyncio.wait_for(self.handoff_changed.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                pass
+                    self.store.handoff_flag(event["id"], f"Unable to reconcile prior Codex turn: {exc}")
+            for event in self.store.handoff_unrecorded():
+                try:
+                    delivery = await host.reconcile(event["binding"], event["turn_id"])
+                    if delivery.status in {"completed", "failed", "interrupted"}:
+                        self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
+                    elif delivery.status == "inProgress":
+                        watch(event["id"], scoped_binding(event), event["turn_id"])
+                    else:
+                        self.store.handoff_flag(event["id"], "Unable to reconcile acknowledged Codex turn")
+                except Exception as exc:
+                    self.store.handoff_flag(event["id"], f"Cannot reconcile acknowledged Codex turn: {exc}")
+            while not self.stopping:
+                self.recover_goals()
+                ready = self.store.handoff_ready()
+                busy = self.store.handoff_busy_threads()
+                processed = False
+                for event in ready:
+                    thread_id = event["binding"].get("thread_id", "")
+                    if thread_id in busy:
+                        continue
+                    task = self.store.one(event["task_id"])
+                    job = self.jobs.get(task["id"])
+                    if task["status"] != "waiting_answer" and job and not job.done():
+                        continue  # Results are reviewable only after the worker has stopped changing files.
+                    try:
+                        current_binding = projects().get(task["project_id"], {}).get("handoff")
+                    except BridgeError as exc:
+                        self.store.handoff_defer(event["id"], str(exc), 30)
+                        processed = True
+                        continue
+                    if (not isinstance(current_binding, dict) or current_binding.get("mode") != "automatic"
+                            or current_binding.get("thread_id") != thread_id):
+                        self.store.handoff_suspend_project(task["project_id"])
+                        self.store.event(event["task_id"], "handoff_disabled",
+                                         {"event_id": event["id"], "reason": "Project binding changed"})
+                        processed = True
+                        if task.get("goal") and task["goal"]["status"] == "active":
+                            self.store.set_goal(task["id"], "blocked", "Automatic project binding changed or was removed")
+                        continue
+                    max_turns = min(event["binding"].get("max_turns", 3),
+                                    current_binding.get("max_turns", 3))
+                    if self.store.handoff_started_count(event["task_id"]) >= max_turns:
+                        self.store.handoff_stop(event["id"], "Codex handoff turn limit reached")
+                        self.store.event(event["task_id"], "handoff_disabled",
+                                         {"event_id": event["id"], "reason": "Codex handoff turn limit reached"})
+                        processed = True
+                        if task.get("goal") and task["goal"]["status"] == "active":
+                            self.store.set_goal(task["id"], "blocked", "Codex handoff turn limit reached")
+                        continue
+                    if task.get("goal") and task["goal"]["status"] != "active":
+                        self.store.handoff_supersede(event["id"])
+                        processed = True
+                        continue
+                    question_pending = (event["kind"] != "question" or any(
+                        q["id"] == event["summary"].get("question_id")
+                        for q in self.store.pending_questions(event["task_id"])))
+                    if not self._handoff_current(event, task) or not question_pending:
+                        self.store.handoff_supersede(event["id"])
+                        processed = True
+                        continue
+                    try:
+                        capability = await host.probe(event["binding"])
+                        if not capability.connected:
+                            self.store.handoff_defer(event["id"], capability.reason or "Codex host unavailable", 30)
+                            processed = True
+                            continue
+                        if not self.store.handoff_begin(event["id"]):
+                            processed = True
+                            continue
+                        delivery = await host.deliver(scoped_binding(event), event["id"],
+                                                      self._handoff_prompt(event))
+                        if delivery.turn_id:
+                            self.store.handoff_accept(event["id"], delivery.turn_id)
+                            self.store.event(event["task_id"], "handoff_accepted",
+                                             {"event_id": event["id"], "turn_id": delivery.turn_id})
+                            busy.add(thread_id)
+                            if delivery.status == "inProgress":
+                                effective = {**scoped_binding(event), "turn_seconds": min(
+                                    event["binding"].get("turn_seconds", 600),
+                                    current_binding.get("turn_seconds", 600))}
+                                watch(event["id"], effective, delivery.turn_id)
+                            else:
+                                self.store.handoff_record_turn(event["id"], delivery.status, delivery.result)
+                                if self.store.handoff_one(event["id"])["status"] == "accepted":
+                                    self.store.handoff_flag(event["id"], "Codex turn ended without a handling receipt")
+                        elif delivery.status == "busy":
+                            self.store.handoff_defer(event["id"], "Codex session is busy", 3600)
+                            watch_idle(event["id"], event["binding"])
+                        else:
+                            if delivery.status == "unknown":
+                                await reconcile_uncertain(event, delivery.error or "unknown result")
+                            else:
+                                self.store.handoff_retry(event["id"], delivery.error or delivery.status)
+                    except Exception as exc:
+                        await reconcile_uncertain(event, str(exc))
+                    processed = True
+                if processed:
+                    continue
+                due = self.store.handoff_next_due()
+                timeout = min(30, max(0.1, due - time.time())) if due is not None else 30
+                self.handoff_changed.clear()
+                try:
+                    await asyncio.wait_for(self.handoff_changed.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            for job in watchers:
+                job.cancel()
+            await asyncio.gather(*watchers, return_exceptions=True)
 
     @staticmethod
     def _public_task(item: dict) -> dict:
@@ -592,7 +636,13 @@ class Executor:
             raise BridgeError("INVALID_ARGUMENT", "limits.wall_seconds must be at least limits.seconds")
         if "usd" in limits:
             raise BridgeError("INVALID_ARGUMENT", "CC cost is not a task limit; omit limits.usd")
+        if set(limits) - {"seconds", "wall_seconds", "rounds"}:
+            raise BridgeError("INVALID_ARGUMENT", "Unknown task limit")
         max_rounds = self._number(project.get("limits", {}).get("rounds", 3), 1, 10)
+        requested_rounds = self._number(limits.get("rounds", max_rounds), 1, 10)
+        if requested_rounds > max_rounds:
+            raise BridgeError("LIMIT_REACHED", "Task rounds exceed project limit")
+        max_rounds = requested_rounds
         requested_handoff = params.get("handoff")
         if requested_handoff is None:
             requested_handoff = "automatic" if (project.get("handoff") or {}).get("mode") == "automatic" else "manual"
@@ -690,6 +740,9 @@ class Executor:
             and item["exit_reason"] == "daemon_restart") or (failed_write and fresh_session)
         if not resumable or (not fresh_session and not item["session_id"]):
             raise BridgeError("INVALID_STATE", "Task cannot be resumed")
+        if item["status"] in {"failed", "interrupted"} and not fresh_session:
+            raise BridgeError("INVALID_STATE", "Interrupted or failed workers require a fresh session")
+        current_project = self._current_project(item)
         if fresh_session and (item["status"] not in {"review_required", "failed", "interrupted"} or
                               item["bundle"].get("backend") != "native_write"):
             raise BridgeError("INVALID_STATE", "Fresh-session relay requires an inspected write task")
@@ -712,7 +765,7 @@ class Executor:
                 self.store.event(item["id"], "limits_upgraded", {
                     "seconds": item["bundle"]["limits"]["seconds"],
                     "wall_seconds": wall_seconds})
-        if item["round_no"] >= item["bundle"]["limits"]["rounds"]:
+        if item["round_no"] >= min(item["bundle"]["limits"]["rounds"], current_project.get("limits", {}).get("rounds", 3)):
             raise BridgeError("LIMIT_REACHED", "Task round limit reached")
         instruction = self._text(params.get("instruction"), "instruction")
         updated_scope = params.get("scope")
@@ -739,13 +792,14 @@ class Executor:
                                            "workspace": evidence, "created_at": time.time()}
         elif review_note or params.get("expected_head"):
             raise BridgeError("INVALID_ARGUMENT", "Checkpoint arguments require an autonomous goal or scope replan")
-        self._admit_parallel(item["project_id"], item["project"], item["bundle"], item["id"])
+        self._admit_parallel(item["project_id"], current_project, item["bundle"], item["id"])
         round_no = item["round_no"] + 1
         self.store.transition(item["id"], "continuing", {"round_no": round_no, "instruction": instruction,
                               "review_note": review_note, "scope": item["bundle"]["scope"]},
                               before=("INSERT INTO rounds(task_id,round_no,instruction,status,request_id) VALUES(?,?,?,?,?)",
                                       (item["id"], round_no, instruction, "queued", request_id)),
                               status="continuing", round_no=round_no, result_json=None,
+                              exit_reason=None, exit_code=None,
                               bundle_json=json.dumps(item["bundle"], ensure_ascii=False))
         result = {"task_id": item["id"], "round_no": round_no, "status": "continuing",
                   "fresh_session": fresh_session, "scope": item["bundle"]["scope"]}
@@ -759,6 +813,9 @@ class Executor:
         if existing:
             return existing
         item = self.store.one(safe_id(params.get("task_id"), "task_id"))
+        job = self.jobs.get(item["id"])
+        if job and not job.done():
+            raise BridgeError("INVALID_STATE", "Worker cleanup must finish before acceptance")
         failed_write = (item["status"] == "failed" and
                         (item.get("bundle") or {}).get("backend") == "native_write")
         if item["status"] != "review_required" and not failed_write:
@@ -848,6 +905,7 @@ class Executor:
             raise BridgeError("INVALID_STATE", "Task is not active")
         self.store.transition(item["id"], "canceled", {}, status="canceled",
                               exit_reason="user_cancel", cancel_request_id=request_id)
+        self._expire_answers(item["id"])
         await self._stop_process(item["id"])
         if (item.get("bundle") or {}).get("backend") == "native_write":
             try:
@@ -864,7 +922,7 @@ class Executor:
 
     async def _stop_process(self, task_id: str) -> None:
         proc = self.processes.get(task_id)
-        if proc and proc.returncode is None:
+        if proc:
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -880,16 +938,61 @@ class Executor:
                     # not a new CLI failure that should replace the task's
                     # original LIMIT_REACHED or cancellation reason.
                     return
-                await proc.wait()
+                try:
+                    await asyncio.wait_for(proc.wait(), 5)
+                except asyncio.TimeoutError:
+                    pass  # A detached descendant can retain a pipe even after group termination.
+            else:
+                # The leader exiting does not mean its test/build children have exited.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    @staticmethod
+    def _current_project(item: dict) -> dict:
+        current = project_config(item["project_id"])
+        if current["root"] != item["project"]["root"]:
+            raise BridgeError("PROJECT_NOT_ALLOWED", "Project root changed since submission")
+        bundle = item["bundle"]
+        if bundle.get("backend") == "native_write":
+            if not current["write_backend"].get("enabled"):
+                raise BridgeError("PROJECT_NOT_ALLOWED", "Project write authorization was revoked")
+            validate_write_scope(current["write_backend"]["write_paths"], bundle["scope"])
+        elif not set(bundle["scope"]).issubset(current["read_paths"]):
+            raise BridgeError("PROJECT_NOT_ALLOWED", "Project read authorization was revoked")
+        return current
 
     async def run_task(self, task_id: str, instruction: str | None = None,
                        *, fresh_session: bool = False) -> None:
+        try:
+            await self._run_task(task_id, instruction, fresh_session=fresh_session)
+        except asyncio.CancelledError:
+            await self._stop_process(task_id)
+            raise
+        except Exception as exc:
+            await self._stop_process(task_id)
+            self._fail(task_id, exc.code if isinstance(exc, BridgeError) else "CLI_FAILED", str(exc))
+        finally:
+            self.store.update(task_id, process_id=None)
+            self.processes.pop(task_id, None)
+            if self.jobs.get(task_id) is asyncio.current_task():
+                self.jobs.pop(task_id, None)
+            self.handoff_changed.set()
+
+    async def _run_task(self, task_id: str, instruction: str | None = None,
+                        *, fresh_session: bool = False) -> None:
         item = self.store.one(task_id)
         bundle, project = item["bundle"], item["project"]
         write_task = bundle.get("backend") == "native_write"
         if item["status"] == "canceled":
-            self.jobs.pop(task_id, None)
             return
+        current = self._current_project(item)
+        # A saved queue entry cannot preserve revoked authorization or larger limits.
+        for name in ("seconds", "wall_seconds"):
+            configured = current.get("limits", {})
+            maximum = configured.get(name, configured.get("seconds", 3600))
+            bundle["limits"][name] = min(bundle["limits"].get(name, bundle["limits"]["seconds"]), maximum)
         cli = project.get("claude_path") or shutil.which("claude")
         if not cli or not Path(cli).exists():
             self._fail(task_id, "CLI_FAILED", "Claude CLI is unavailable")
@@ -930,6 +1033,7 @@ class Executor:
             self._fail(task_id, exc.code, str(exc))
             return
         env["CODEX1CC_TASK_ID"] = task_id
+        env["CODEX1CC_STATE_DIR"] = str(STATE.resolve())
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
         context_policy = project.get("context_policy") or {
             "auto_compact_window": 500000, "auto_compact_percent": 70}
@@ -949,7 +1053,7 @@ class Executor:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command, cwd=item["snapshot_path"], env=env, start_new_session=True,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 limit=1024 * 1024 + 1024)
             stderr_task = asyncio.create_task(self._collect_stderr(proc.stderr))
             self.processes[task_id] = proc
@@ -974,9 +1078,9 @@ class Executor:
                 except asyncio.TimeoutError:
                     line = None
                 now = time.monotonic()
+                tick = now - last_tick
+                wall_elapsed += tick
                 if self.store.one(task_id)["status"] != "waiting_answer":
-                    tick = now - last_tick
-                    wall_elapsed += tick
                     if write_task and now >= next_process_check:
                         next_process_check = now + 0.2
                         observed_external = self._external_command_running(proc.pid)
@@ -991,17 +1095,22 @@ class Executor:
                     await asyncio.sleep(0)  # Buffered CLI output must not starve RPC and controller timers.
                 wall_limit = bundle["limits"].get("wall_seconds", bundle["limits"]["seconds"])
                 if wall_elapsed >= wall_limit:
-                    self._fail(task_id, "LIMIT_REACHED", "Task hard wall time limit reached")
                     await self._stop_process(task_id)
+                    self._fail(task_id, "LIMIT_REACHED", "Task hard wall time limit reached")
                     return
                 if active_elapsed >= bundle["limits"]["seconds"]:
-                    self._fail(task_id, "LIMIT_REACHED", "CC agent work time limit reached")
                     await self._stop_process(task_id)
+                    self._fail(task_id, "LIMIT_REACHED", "CC agent work time limit reached")
                     return
                 if line is None:
                     continue
                 if not line:
-                    break
+                    if proc.returncode is not None and stderr_task.done():
+                        break
+                    # EOF is not process exit. Keep enforcing deadlines while either
+                    # the worker or an inherited stderr pipe is still alive.
+                    await asyncio.sleep(0.05)
+                    continue
                 if len(line) > 1024 * 1024:
                     self.store.event(task_id, "output_truncated", {})
                     continue
@@ -1026,6 +1135,7 @@ class Executor:
                     self.store.event(task_id, "claude_event", event)
             stderr = await stderr_task
             code = await proc.wait()
+            await self._stop_process(task_id)  # Reap the worker's remaining process group before review.
             if self.store.one(task_id)["status"] in {"canceled", "review_required"}:
                 return
             if code or not result or result.get("is_error"):
@@ -1051,13 +1161,13 @@ class Executor:
                                   usage_json=json.dumps(scrub(usage), ensure_ascii=False))
             self.handoff_changed.set()
         except Exception as exc:
-            self._fail(task_id, "CLI_FAILED", str(exc))
             await self._stop_process(task_id)
+            self._fail(task_id, "CLI_FAILED", str(exc))
         finally:
-            if self.store.one(task_id)["process_id"]:
-                self.store.update(task_id, process_id=None)
-            self.processes.pop(task_id, None)
-            self.jobs.pop(task_id, None)
+            if "stderr_task" in locals():
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
 
     @staticmethod
     def _prompt(bundle: dict) -> str:
@@ -1156,7 +1266,6 @@ class Executor:
         return b"".join(chunks).decode(errors="replace")
 
     def _fail(self, task_id: str, code: str, message: str) -> None:
-        self.jobs.pop(task_id, None)
         item = self.store.one(task_id)
         if item["status"] in {"canceled", "review_required", "completed", "failed"}:
             return
@@ -1177,7 +1286,16 @@ class Executor:
                                                    "workspace": summary.get("workspace")},
                               status="failed", exit_reason=code,
                               result_json=json.dumps(scrub(summary), ensure_ascii=False))
+        self._expire_answers(task_id)
         self.handoff_changed.set()
+
+    def _expire_answers(self, task_id: str) -> None:
+        rows = self.store.db.execute("SELECT id FROM questions WHERE task_id=? AND status='expired'",
+                                     (task_id,)).fetchall()
+        for row in rows:
+            future = self.answers.pop(row["id"], None)
+            if future and not future.done():
+                future.set_exception(BridgeError("QUESTION_EXPIRED", "Worker stopped before the question was answered"))
 
     def doctor(self) -> dict:
         ready, reason = linux_available()
@@ -1199,6 +1317,8 @@ class Executor:
         except BridgeError:
             pass
         return {"protocol_version": 3, "platform": sys.platform, "claude_path": shutil.which("claude"),
+                "instance_id": self.instance_id,
+                "services": self.service_health,
                 "autonomous": {"available": True, "default_for_automatic_write": True,
                                "active_goals": self.store.db.execute("SELECT COUNT(*) FROM goals WHERE status='active'").fetchone()[0]},
                 "config_path": str(__import__("codex1cc.common", fromlist=["CONFIG"]).CONFIG),
@@ -1210,6 +1330,11 @@ class Executor:
 
 
 async def serve() -> None:
+    with executor_lock():
+        await _serve()
+
+
+async def _serve() -> None:
     os.umask(0o077)
     private_dir(STATE)
     if SOCKET.exists():
@@ -1222,8 +1347,8 @@ async def serve() -> None:
             SOCKET.unlink()
     shutdown_event = asyncio.Event()
     executor = Executor(shutdown_event)
-    handoff_job = asyncio.create_task(executor.handoff_loop())
-    notification_job = asyncio.create_task(executor.notification_loop())
+    handoff_job = asyncio.create_task(executor.supervise("handoff", executor.handoff_loop))
+    notification_job = asyncio.create_task(executor.supervise("notifications", executor.notification_loop))
     for queued in executor.store.queued():
         executor.jobs[queued["id"]] = asyncio.create_task(executor.run_task(queued["id"]))
 

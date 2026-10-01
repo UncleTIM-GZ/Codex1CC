@@ -8,9 +8,20 @@ import tempfile
 import unittest
 
 from codex1cc.store import Store
+from codex1cc.common import BridgeError
 
 
 class StoreMigrationTest(unittest.TestCase):
+    def test_older_executor_does_not_downgrade_newer_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            with sqlite3.connect(path) as db:
+                db.execute("PRAGMA user_version=99")
+            with self.assertRaises(BridgeError):
+                Store(path)
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 99)
+
     def test_old_database_is_backed_up_and_migrated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite3"

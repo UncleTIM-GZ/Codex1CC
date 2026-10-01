@@ -379,6 +379,7 @@ class ExecutorTest(unittest.TestCase):
         task = self.call("get_task", {"task_id": started["data"]["task_id"]})["data"]["task"]
         self.assertEqual(task["request"]["limits"]["seconds"], 14400)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc clock accounting")
     def test_external_command_pauses_agent_clock_but_not_wall_clock(self) -> None:
         self._enable_write_backend(["README.txt"])
         config = json.loads(self.config.read_text())
@@ -761,6 +762,121 @@ class ExecutorTest(unittest.TestCase):
         canceled = self.call("cancel_task", {"task_id": task_id, "request_id": uuid.uuid4().hex})
         self.assertEqual(canceled["data"]["status"], "canceled")
         self.assertEqual(self.call("get_task", {"task_id": task_id})["data"]["task"]["status"], "canceled")
+
+    def test_closed_stdout_cannot_bypass_hard_deadline(self) -> None:
+        self.cli.write_text("#!/usr/bin/env python3\nimport os,time\nos.close(1)\ntime.sleep(60)\n")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "EOF is not exit",
+            "acceptance": ["bounded"], "deliverables": ["result"],
+            "scope": ["README.txt"], "limits": {"seconds": 1, "wall_seconds": 1},
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            task = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if task["status"] == "failed":
+                break
+            time.sleep(0.03)
+        self.assertEqual(task["exit_reason"], "LIMIT_REACHED", task)
+
+    def test_child_stderr_pipe_cannot_bypass_hard_deadline(self) -> None:
+        self.cli.write_text(
+            "#!/usr/bin/env python3\nimport subprocess,sys,json\n"
+            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], stdout=subprocess.DEVNULL)\n"
+            "print(json.dumps({'type':'result','result':'done','is_error':False}),flush=True)\n")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "Inherited stderr",
+            "acceptance": ["bounded"], "deliverables": ["result"],
+            "scope": ["README.txt"], "limits": {"seconds": 1, "wall_seconds": 1},
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task_id = first["data"]["task_id"]
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            task = self.call("get_task", {"task_id": task_id})["data"]["task"]
+            if task["status"] == "failed":
+                break
+            time.sleep(0.03)
+        self.assertEqual(task["exit_reason"], "LIMIT_REACHED", task)
+
+    def test_second_daemon_cannot_mutate_live_task_state(self) -> None:
+        self.cli.write_text("#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n")
+        started = self.call("submit_task", {
+            "project_id": "sample", "objective": "singleton", "acceptance": ["done"],
+            "deliverables": ["result"], "scope": ["README.txt"], "request_id": uuid.uuid4().hex})
+        self.assertTrue(started["ok"], started)
+        second = subprocess.run([sys.executable, "-m", "tests.fake_daemon"], env=self.env,
+                                capture_output=True, timeout=5)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn(b"already owns", second.stderr)
+        task_id = started["data"]["task_id"]
+        self.assertEqual(self.call("get_task", {"task_id": task_id})["data"]["task"]["status"], "running")
+        self.call("cancel_task", {"task_id": task_id, "request_id": uuid.uuid4().hex})
+
+    def test_requested_round_limit_is_preserved(self) -> None:
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "round cap", "acceptance": ["done"],
+            "deliverables": ["result"], "scope": ["README.txt"], "limits": {"rounds": 1},
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        task = self.call("get_task", {"task_id": first["data"]["task_id"]})["data"]["task"]
+        self.assertEqual(task["request"]["limits"]["rounds"], 1)
+
+    def test_concurrent_cold_start_has_only_one_state_owner(self) -> None:
+        race_state = self.state.parent / "race-state"
+        race_state.mkdir()
+        env = {**self.env, "CODEX1CC_STATE_DIR": str(race_state)}
+        script = (
+            "import asyncio,time\nfrom codex1cc import daemon\n"
+            "original=daemon.Executor.__init__\n"
+            "def slow_init(self,*args,**kwargs):\n"
+            " with (daemon.STATE/'owners').open('a') as log: log.write('entered\\n')\n"
+            " time.sleep(0.5)\n original(self,*args,**kwargs)\n"
+            "daemon.Executor.__init__=slow_init\nasyncio.run(daemon.serve())\n")
+        processes = []
+        try:
+            first = subprocess.Popen([sys.executable, "-c", script], env=env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            processes.append(first)
+            deadline = time.monotonic() + 3
+            while not (race_state / "owners").exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue((race_state / "owners").exists())
+            self.assertFalse((race_state / "daemon.sock").exists())
+            second = subprocess.Popen([sys.executable, "-c", script], env=env,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            processes.append(second)
+            _, stderr = second.communicate(timeout=3)
+            self.assertNotEqual(second.returncode, 0, stderr)
+            self.assertEqual((race_state / "owners").read_text().splitlines(), ["entered"])
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.terminate()
+                process.communicate(timeout=5)
+
+    def test_staged_outside_scope_edit_is_reported_even_when_working_file_is_restored(self) -> None:
+        self._enable_write_backend(["README.txt"])
+        self.cli.write_text(
+            "#!/usr/bin/env python3\nimport json,pathlib,subprocess,sys\n"
+            "if '--help' in sys.argv:\n"
+            " print('--print --output-format --permission-mode --tools --strict-mcp-config --resume'); sys.exit(0)\n"
+            "p=pathlib.Path('PRIVATE.txt'); original=p.read_text(); p.write_text('staged change')\n"
+            "subprocess.run(['git','add','PRIVATE.txt'],check=True); p.write_text(original)\n"
+            "print(json.dumps({'type':'result','result':'done','is_error':False}),flush=True)\n")
+        first = self.call("submit_task", {
+            "project_id": "sample", "objective": "index coverage", "acceptance": ["done"],
+            "deliverables": ["result"], "scope": ["README.txt"], "actions": ["read", "write", "execute"],
+            "request_id": uuid.uuid4().hex})
+        self.assertTrue(first["ok"], first)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            task = self.call("get_task", {"task_id": first["data"]["task_id"]})["data"]["task"]
+            if task["status"] == "review_required":
+                break
+            time.sleep(0.03)
+        self.assertEqual(task["result"]["workspace"]["outside_scope"], ["PRIVATE.txt"])
 
     def test_shutdown_without_active_tasks(self) -> None:
         result = self.call("shutdown", {})

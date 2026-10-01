@@ -135,8 +135,10 @@ def artifacts(root_value: str, workspace: dict, scope: list[str]) -> dict:
     path = verify_worktree(root_value, workspace)
     base = workspace["base_commit"]
     head = _git(path, "rev-parse", "HEAD")
+    _git(path, "merge-base", "--is-ancestor", base, head)
     commits = _git(path, "log", "--format=%H %s", f"{base}..HEAD").splitlines()
     changed = set(filter(None, _git(path, "diff", "--no-renames", "--name-only", "-z", base).split("\0")))
+    changed.update(filter(None, _git(path, "diff", "--cached", "--no-renames", "--name-only", "-z", base).split("\0")))
     changed.update(filter(None, _git(path, "ls-files", "-z", "--others", "--exclude-standard").split("\0")))
     dirty = bool(_git(path, "status", "--porcelain", "--untracked-files=normal"))
     outside = sorted(p for p in changed if not _inside(p, scope))

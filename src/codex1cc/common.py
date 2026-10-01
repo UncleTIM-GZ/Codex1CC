@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from contextlib import contextmanager
 
 def _state_dir() -> Path:
     if sys.platform == "darwin":
@@ -32,6 +33,23 @@ class BridgeError(Exception):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+@contextmanager
+def executor_lock():
+    """Own the state before opening SQLite or inspecting/removing its socket."""
+    import fcntl
+
+    private_dir(STATE)
+    fd = os.open(STATE / "daemon.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise BridgeError("DAEMON_RUNNING", "Executor already owns this state directory") from exc
+        yield
+    finally:
+        os.close(fd)
 
 
 def private_dir(path: Path) -> None:
