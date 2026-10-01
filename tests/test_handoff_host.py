@@ -27,6 +27,7 @@ class ProtocolPeer:
         self.approval_response = None
         self.approval_received = asyncio.Event()
         self.approval_during_start = False
+        self.foreign_unload = False
 
     def approval_request(self, ident):
         return {"id": ident, "method": "mcpServer/elicitation/request",
@@ -65,9 +66,12 @@ class ProtocolPeer:
                         thread["turns"] = list(self.turns)
                     result = {"thread": thread}
                 elif method == "thread/resume":
+                    if self.foreign_unload:
+                        await socket.send(json.dumps({"method": "thread/status/changed", "params": {
+                            "threadId": "unrelated-thread", "status": {"type": "notLoaded"}}}))
                     result = {"thread": {"id": "saved-thread"}}
                 elif method == "mcpServerStatus/list":
-                    names = ["get_task", "respond_task", "continue_task", "complete_task"]
+                    names = ["get_task", "respond_task", "continue_task", "complete_task", "manage_goal"]
                     if self.include_ack:
                         names.append("ack_handoff")
                     result = {"data": [{"name": "codex1cc", "runtimeStatus": "connected",
@@ -150,6 +154,12 @@ class HandoffHostTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(duplicate.turn_id, started.turn_id)
         self.assertEqual(self.peer.starts, 1)
 
+    async def test_foreign_thread_unload_does_not_stop_controller_observation(self):
+        self.peer.foreign_unload = True
+        started = await self.host.deliver(self.binding, "event-foreign", "Inspect the task")
+        result = await self.host.wait_for_turn(self.binding, started.turn_id, timeout=2)
+        self.assertEqual(result.status, "completed")
+
     async def test_approval_is_scoped_to_current_task_even_before_waiter_attaches(self):
         self.peer.approval_tool = "get_task"
         self.peer.approval_task_id = "task-1"
@@ -177,6 +187,16 @@ class HandoffHostTests(unittest.IsolatedAsyncioTestCase):
         binding = {**self.binding, "_handoff_task_id": "task-1",
                    "_handoff_event_id": "event-6", "_handoff_receipt_token": "secret"}
         started = await self.host.deliver(binding, "event-6", "Inspect the task")
+        await asyncio.wait_for(self.peer.approval_received.wait(), 1)
+        self.assertEqual(self.peer.approval_response["result"]["action"], "accept")
+        self.assertEqual((await self.host.wait_for_turn(binding, started.turn_id, timeout=2)).status, "completed")
+
+    async def test_goal_management_is_automatically_approved_for_delivered_task(self):
+        self.peer.approval_tool = "manage_goal"
+        self.peer.approval_task_id = "task-1"
+        binding = {**self.binding, "_handoff_task_id": "task-1",
+                   "_handoff_event_id": "event-goal", "_handoff_receipt_token": "secret"}
+        started = await self.host.deliver(binding, "event-goal", "Manage the goal")
         await asyncio.wait_for(self.peer.approval_received.wait(), 1)
         self.assertEqual(self.peer.approval_response["result"]["action"], "accept")
         self.assertEqual((await self.host.wait_for_turn(binding, started.turn_id, timeout=2)).status, "completed")

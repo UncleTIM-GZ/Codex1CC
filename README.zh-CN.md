@@ -6,9 +6,9 @@ Codex1CC 让你在 Codex 中把一项明确的工作交给 Claude Code（简称 
 
 这个工具需要安装在能够访问项目文件和 Claude Code 的电脑上。安装后，Codex 通过 MCP（连接外部工具的接口）调用它；你无需自行运行网页服务。可选的自动接管模式会在 CC 完成、提问或异常时启动已绑定的 Codex 会话；运行记录也可用命令行查看。自动处理结果保存在任务记录中，不保证弹出原来的 Codex 窗口。
 
-**当前是 alpha。** Linux 只读任务与自动接管各通过一次真实任务；写入后端通过模拟测试及一次临时项目的真实编辑、命令验证、本地提交和待验收交付。真实写入任务的 Codex 自动验收与跨机器验收仍待完成。写入模式允许 CC 执行命令，属于显式信任项目模式，不能当作本机文件或网络沙箱。macOS 只读隔离尚未实现；原生 Windows 未支持。完整门槛见 [验证记录](docs/validation.md)。
+**当前是 alpha。** Linux 只读任务与自动接管各通过一次真实任务；写入后端通过模拟测试及临时项目的真实两轮修复，包括 Codex 自动调整范围、回答 CC 提问、本地提交和最终验收，详见[自动目标验证记录](docs/autonomous-validation.md)。跨机器验收仍待完成。写入模式允许 CC 执行命令，属于显式信任项目模式，不能当作本机文件或网络沙箱。macOS 只读隔离尚未实现；原生 Windows 未支持。完整门槛见 [验证记录](docs/validation.md)。
 
-自动接管按 [PRD v1.6](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试和一次真实 CC → Codex 自动验收已通过。宿主运行中重启恢复、真实问题交接及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
+自动接管按 [PRD v1.6](Codex1CC%20产品需求文档.md) 实现了实验性 Linux 路径；模拟测试、真实 CC → Codex 自动验收及真实问题交接已通过。宿主运行中重启恢复及跨机器兼容性仍待验收，详见 [验证记录](docs/validation.md)与[兼容性记录](docs/handoff-compatibility.md)。手动模式仍可使用。
 
 ## 项目逻辑图
 
@@ -96,9 +96,19 @@ codex mcp list
 
 ### 长程任务与上下文保护
 
+从 0.6 起，原生写入任务选择自动接管时默认启用 `autonomous=true`，保存原始目标、全部验收项和首次项目授权。CC 一轮失败后目标继续有效，Codex 必须核查产物后续派，或用 `manage_goal` 记录具体阻塞；仅反馈“下一步需修复”不能结束活动目标。`autonomous=false` 保留单次事件审查模式。
+
+如果用户对整个目标明确限制了改动路径，提交时用 `authorized_scope` 固化这一更窄的边界；`scope` 则描述当前 CC 轮次的范围。升级时可运行 `codex1cc upgrade TASK_ID`，服务切换后自动接管该任务尚未完成的保留成果。
+
+续派时提供 `fresh_session=true`、明确指令、`review_note` 和已核查的 `expected_head`。可用 `scope` 调整修复路径；执行器同时检查首次与当前项目授权，保留原工作树和提交，原始验收项不变，无需先合并主分支。已有越出任务范围的改动会阻止重新规划。完成时必须提供已核查的 `expected_head`，以及与原始验收项一一对应的 `acceptance_evidence`。
+
+实际技术阻塞或轮数用尽用 `manage_goal(status="blocked", reason=...)`，真正需要用户取舍才用 `needs_user`；`active` 可接管未完成的旧自动写任务或恢复目标。接管旧任务时保留首次路径授权，并采用当前配置的轮数与接管回合上限。活动目标无工作进程且无待处理事件时，执行器创建新的恢复决策事件；先前回合效果不确定时明确记录阻塞并通知，不重放旧事件。`limits.rounds` 和 `handoff.max_turns` 最高均为 10。
+
+运行 `codex1cc follow TASK_ID` 可持续查看简洁事件并跨轮跟随，`codex1cc status PROJECT_ID` 查看任务和目标，`codex1cc notifications` 查看持久通知及投递错误。审查结论、续派、完成和阻塞会主动尝试桌面通知，WSL 使用 Windows 通知服务；不保证原 Codex 窗口自动打开。安装新版后运行 `codex1cc upgrade`，程序会等待已有 CC 进程和 Codex 接管回合结束，再切换执行器并刷新技能和 MCP 工具；数据库迁移前创建备份。
+
 Codex1CC 为自己启动的 CC 任务默认设置更早的自动压缩：将自动压缩窗口设为最多 500000 token，达到该窗口的 70% 时交由 Claude Code 压缩；模型实际窗口更小时，以较小值计算。可逐项目调整，例如 `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`。窗口可设 100000–1000000，百分比可设 1–90；实际效果还取决于所用 CLI、模型和 Claude 设置。在 Linux 原生写入任务中，`limits.seconds` 只累计 CC 自身阅读、思考和编码时间；检测到测试、构建或门禁等非桥接子进程运行时暂停。`limits.wall_seconds` 始终累计，并在总硬上限终止整轮。为保持旧配置兼容，两者默认相同，最高均为 86400 秒。长日志请写文件并只返回结论、退出码与路径。
 
-一个写入任务正常交付阶段结果后，Codex 可核对产物，再调用 `continue_task(..., fresh_session=true)` 在同一任务工作树开启全新 CC 会话；该模式不载入旧会话历史。失败的写任务也可这样接续，但 Codex 必须先明确核查保留的差异、提交、范围和测试证据，并在接续指令里写清已验证内容与剩余工作。若 CC 仍报上下文超限，任务会标为 `CONTEXT_LIMIT` 并保留写入工作树，自动接管会通知 Codex 核查。**不会自动重试失败或已溢出的旧会话**；无需人审的阶段检查点与接力仍待实现和验收。直接在 Claude Code 中启动的后台作业不受 Codex1CC 任务机制管理。设计和剩余工作见[长程任务计划](docs/long-running-tasks-plan.md)。
+一个写入任务正常交付阶段结果后，Codex 可核对产物，再调用 `continue_task(..., fresh_session=true)` 在同一任务工作树开启全新 CC 会话；该模式不载入旧会话历史。失败的写任务也可这样接续，但 Codex 必须先明确核查保留的差异、提交、范围和测试证据，并在接续指令里写清已验证内容与剩余工作。若 CC 仍报上下文超限，任务会标为 `CONTEXT_LIMIT` 并保留写入工作树，自动接管会通知 Codex 核查。**不会自动重试失败或已溢出的旧会话**；CC 轮次之间的 Codex 自动审查与新会话接力已通过真实两轮任务；运行中的 CC 轮次内主动检查点仍待实现和验收。直接在 Claude Code 中启动的后台作业不受 Codex1CC 任务机制管理。设计和剩余工作见[长程任务计划](docs/long-running-tasks-plan.md)。
 
 ### 可选：授权 CC 编码与测试（实验性）
 

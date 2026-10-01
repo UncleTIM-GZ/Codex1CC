@@ -14,12 +14,24 @@ from .common import CONFIG, STATE, BridgeError, atomic_json, rpc
 def main() -> None:
     parser = argparse.ArgumentParser(prog="codex1cc")
     parser.add_argument("command", choices=["mcp", "doctor", "stop", "init-config", "config-path",
-                                            "install-skill", "watch", "bind", "unbind"])
+                                            "install-skill", "watch", "follow", "notifications", "status", "upgrade", "bind", "unbind"])
     parser.add_argument("target", nargs="?")
     parser.add_argument("thread_id", nargs="?")
     parser.add_argument("--create", action="store_true", help="Create a dedicated Codex thread (one model call)")
     parser.add_argument("--force", action="store_true", help="Replace managed files of an installed skill")
+    parser.add_argument("--cursor", type=int, default=0, help="Read inbox notifications after this sequence")
     args = parser.parse_args()
+    if args.command == "upgrade":
+        from .upgrade import upgrade_executor
+        try:
+            if args.target:
+                from .common import safe_id
+                safe_id(args.target, "task_id")
+            asyncio.run(upgrade_executor(args.target))
+        except (BridgeError, OSError) as exc:
+            print(f"UPGRADE_FAILED: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        return
     if args.command == "mcp":
         from .mcp_server import main as mcp_main
         mcp_main()
@@ -38,7 +50,19 @@ def main() -> None:
             print(f"{code}: {exc}", file=sys.stderr)
             raise SystemExit(1)
         return
-    if args.command == "watch":
+    if args.command in {"notifications", "status"}:
+        try:
+            if args.command == "notifications":
+                report = asyncio.run(rpc("notifications", {"cursor": args.cursor}))
+            else:
+                report = asyncio.run(rpc("list_tasks", {"project_id": args.target,
+                    "statuses": ["queued", "running", "continuing", "waiting_answer", "review_required", "failed", "interrupted"]}))
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        except BridgeError as exc:
+            print(f"{exc.code}: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        return
+    if args.command in {"watch", "follow"}:
         from .common import safe_id
         try:
             task_id = safe_id(args.target, "task_id")
@@ -46,7 +70,13 @@ def main() -> None:
             while True:
                 report = asyncio.run(rpc("wait_task", {"task_id": task_id, "cursor": cursor}, timeout=40))
                 for event in report["events"]:
-                    print(json.dumps(event, ensure_ascii=False), flush=True)
+                    if args.command == "watch":
+                        print(json.dumps(event, ensure_ascii=False), flush=True)
+                    elif event["kind"] in {"queued", "running", "continuing", "question", "answer", "failed",
+                                           "review_required", "completed", "goal_status", "goal_recovery", "codex_handoff_result"}:
+                        data = event["data"]
+                        summary = data.get("conclusion") or data.get("reason") or data.get("message") or data.get("text") or ""
+                        print(f"{event['kind']}: {summary}", flush=True)
                 cursor = report["next_cursor"]
                 task = report["task"]
                 handoff = report["handoff"]
@@ -56,7 +86,8 @@ def main() -> None:
                                            ("pending", "sending", "accepted")) or
                                        bool(latest and latest["status"] == "handled" and
                                             latest["turn_id"] and latest["codex_status"] is None))
-                if (task["status"] in {"review_required", "completed", "canceled", "failed", "interrupted"}
+                if (not (task.get("goal") and task["goal"]["status"] == "active")
+                        and task["status"] in {"review_required", "completed", "canceled", "failed", "interrupted", "waiting_answer"}
                         and not report["has_more"] and not waiting_for_handoff):
                     print(json.dumps({"task": task, "handoff": report["handoff"]}, ensure_ascii=False), flush=True)
                     break
@@ -96,7 +127,7 @@ def main() -> None:
             document = json.loads(CONFIG.read_text(encoding="utf-8"))
             document["projects"][project_id]["handoff"] = {
                 "mode": "automatic", "thread_id": thread_id,
-                "max_turns": 3, "turn_seconds": 600}
+                "max_turns": 10, "turn_seconds": 600}
             atomic_json(CONFIG, document)
             print(json.dumps({"project_id": project_id, "thread_id": thread_id,
                               "handoff": "connected"}, ensure_ascii=False))

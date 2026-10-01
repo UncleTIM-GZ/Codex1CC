@@ -101,6 +101,18 @@ uncommitted changes were excluded.
 
 ## Handle delivered events
 
+Automatic native-write submissions default to `autonomous=true`. The configured
+project binding is inherited when `handoff` is omitted; explicitly set manual
+only when the user asks for manual handling. Automatic write submissions return a
+persistent `goal`. Read its original objective, acceptance, and authorized paths
+with `get_task`. A CC round failing does not finish this goal. The controller is
+responsible for repairs until acceptance passes or a specific blocker is recorded.
+When the user explicitly limits paths for the whole objective, set
+`authorized_scope` on submission to preserve that narrower goal authorization.
+`scope` limits the current CC round; it does not erase user constraints in context.
+Do not stop after describing a next step. `autonomous=false` explicitly selects
+the old one-event review behavior.
+
 When Codex1CC delivers a question, result, failure, or interruption:
 
 1. Call `get_task` for that task and verify the current state, original
@@ -109,20 +121,38 @@ When Codex1CC delivers a question, result, failure, or interruption:
    answer. Ask the user for a genuine product choice or new project permission.
    If the current task scope is too narrow but the original objective and
    project write authorization already cover the needed files, review the
-   partial result and submit a new scoped follow-up from a verified Git baseline.
+   partial result and replan an autonomous goal in its retained worktree. For
+   other tasks, submit a new scoped follow-up from a verified Git baseline.
    Do not ask for approval solely to raise a CC cost limit or change a task scope.
 3. For write tasks, inspect the actual branch diff, commits, dirty files,
    outside-scope report, and test evidence. Treat CC's claims as unverified.
    Review evidence before `complete_task`. Use `continue_task` only for a
-   concrete gap inside the original authorization. Never automatically retry a
-   failed or interrupted task. A failed write task may contain valid work. After
+   concrete gap inside the original authorization. Never replay a failed or
+   uncertain CC session. A failed write task may contain valid work. After
    checking the diff, commits, scope, and test evidence, use
    `continue_task(..., fresh_session=true)` to let a new CC session finish the
-   retained work in the same worktree. Give it an exact instruction naming the
+   retained work in the same worktree. For an autonomous goal, supply
+   `review_note` and `expected_head` from the inspected worktree. Give it an exact instruction naming the
    verified work, remaining gaps, and required tests. Do not resume the failed
    CC session. If the retained result already satisfies acceptance,
    `complete_task` may explicitly accept it while retaining the original failure
    reason.
+   If repair requires other paths inside the original project's write authorization,
+   pass a revised `scope` to `continue_task(..., fresh_session=true)` together with
+   `review_note` and `expected_head`. Verify the retained diff has no outside-scope
+   changes first. The executor checks both initial and current project authorization,
+   preserves original acceptance, and records the checkpoint. Reuse the existing
+   worktree; no merge or new baseline is needed. Do not ask for permission solely
+   to make this authorized scope adjustment. A failed or interrupted session must
+   use fresh context.
+   For exhausted time/round/turn limits or a concrete technical blocker, call
+   `manage_goal(status="blocked", reason=...)` before acknowledging failure.
+   Only a genuine user decision or additional authorization uses
+   `manage_goal(status="needs_user", reason=...)`. An active goal cannot be
+   acknowledged merely as failed/reviewed/needs_user. Use `complete_task` only
+   after checking every original acceptance item; pass one `acceptance_evidence`
+   entry per item and the inspected `expected_head`. `manage_goal(status="active")`
+   adopts an unfinished legacy automatic write task or resumes a recorded goal.
    Keep the worktree until the user explicitly
    requests cleanup; do not merge, push, or deploy on task completion alone.
    When a reviewed write task has a documented next phase, use
@@ -154,6 +184,13 @@ explicit review, a failed write task can use a fresh-session relay in its
 retained worktree. Do not silently restart it. Read-only failures still require
 a new scoped task on a verified baseline. Do not claim to manage Claude
 background jobs that were started outside Codex1CC.
+
+Desktop notifications and `codex1cc notifications` expose controller conclusions,
+continuations, completion, and concrete blockers. `codex1cc follow TASK_ID` waits
+for concise events without model polling, and follows an active goal across CC
+round failures. The original Codex window is not guaranteed to reopen. On upgrade,
+wait for active CC workers and Codex turns to finish, restart the executor, refresh
+this skill, and reload App Server MCP configuration before relying on new tools.
 
 Do not expose receipt tokens, configuration contents, credentials, private
 absolute paths, or raw internal event logs in the user-facing response.

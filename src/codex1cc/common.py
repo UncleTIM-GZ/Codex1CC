@@ -81,12 +81,12 @@ async def rpc(method: str, params: dict | None = None, *, autostart: bool = True
     if autostart and not SOCKET.exists():
         await start_daemon()
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(SOCKET)), timeout=5)
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(SOCKET), limit=4 * 1024 * 1024), timeout=5)
     except (OSError, asyncio.TimeoutError):
         if not autostart:
             raise BridgeError("DAEMON_UNAVAILABLE", "Executor is not running")
         await start_daemon()
-        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(SOCKET)), timeout=5)
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(SOCKET), limit=4 * 1024 * 1024), timeout=5)
     try:
         payload = json.dumps({"method": method, "params": params or {}}, ensure_ascii=False).encode() + b"\n"
         if len(payload) > MAX_LINE:
@@ -112,7 +112,7 @@ async def start_daemon() -> None:
     private_dir(STATE)
     if SOCKET.exists():
         try:
-            reader, writer = await asyncio.open_unix_connection(str(SOCKET))
+            reader, writer = await asyncio.open_unix_connection(str(SOCKET), limit=4 * 1024 * 1024)
             writer.close()
             await writer.wait_closed()
             return

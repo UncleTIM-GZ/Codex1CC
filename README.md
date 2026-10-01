@@ -4,13 +4,13 @@ Codex1CC lets you ask Codex to hand a well-defined task to Claude Code and revie
 
 Install Codex1CC where it can access your project files and Claude Code. Codex connects to it through MCP, a tool interface; you do not need to run a web service. Optional automatic handoff starts a bound Codex session when CC finishes, asks a question, or fails. Results are saved with the task; the original Codex window may not reopen.
 
-**Status: alpha.** The Linux read-only runner and automatic handoff have each passed a small real task. The native write backend passed fake-CLI tests and one real edit, command check, local commit, and review-required delivery in a temporary project. Real automatic Codex review of a write task and cross-machine acceptance remain open. Write mode runs commands in a trusted project and is not a filesystem or network sandbox.
+**Status: alpha.** The Linux read-only runner and automatic handoff have each passed a small real task. The native write backend passed fake-CLI tests and a real two-round repair with automatic Codex scope replanning, a CC question answered by Codex, local commits, and final acceptance in a temporary project. See the [autonomous validation record](docs/autonomous-validation.md). Cross-machine acceptance remains open. Write mode runs commands in a trusted project and is not a filesystem or network sandbox.
 
 **中文完整说明：**[安装、项目初始化、指挥 CC、跨会话验收与注意事项](README.zh-CN.md)。
 
 Licensed under MIT; see [LICENSE](LICENSE).
 
-Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and one real CC-to-Codex automatic review passed. Active-host restart recovery, real question handoff, and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), [long-running task plan](docs/long-running-tasks-plan.md), [parallel agent plan](docs/parallel-agents-plan.md), and [PRD v1.6](Codex1CC%20产品需求文档.md). Manual use remains available.
+Experimental automatic handoff is implemented on the supported Linux path. Simulated tests and real CC-to-Codex automatic review and question handoff passed. Active-host restart recovery and installation on other machines remain unverified. See the [validation record](docs/validation.md), [host compatibility](docs/handoff-compatibility.md), [write backend plan](docs/native-write-backend-plan.md), [long-running task plan](docs/long-running-tasks-plan.md), [parallel agent plan](docs/parallel-agents-plan.md), and [PRD v1.6](Codex1CC%20产品需求文档.md). Manual use remains available.
 
 ## How the pieces fit together
 
@@ -82,7 +82,7 @@ Create the shared context file inside the target project before submitting a tas
 
 For tasks it launches, Codex1CC asks Claude Code to compact earlier: by default, at 70% of an auto-compact window capped at 500000 tokens. Claude Code caps that window at the model's actual context size if smaller. Per-project settings may override this, for example `"context_policy": {"auto_compact_window": 500000, "auto_compact_percent": 70}`. The allowed window is 100000–1000000 tokens and the percentage is 1–90; actual behavior also depends on the CLI, model, and Claude settings. On Linux native-write tasks, `limits.seconds` counts time spent by CC itself. It pauses while a non-bridge descendant command such as a test, build, or gate is running. `limits.wall_seconds` continues counting and stops the whole round at its hard cap. Both default to the same value for backward compatibility and may be set up to 86400 seconds. Write long gate output to files and return a conclusion, exit code, and path.
 
-After a write task delivers a reviewed phase, Codex can check the artifacts and known cumulative cost, then call `continue_task(..., fresh_session=true)` to start a new CC session in the same task worktree without loading the old conversation. The same relay is available after a failed write task only when Codex has explicitly inspected its retained diff, commits, scope, and test evidence; the continuation instruction must state what is verified and what remains. If CC still exceeds its context window, the task fails with `CONTEXT_LIMIT` and retains its write worktree. Automatic handoff asks Codex to inspect the evidence. The failed or overflowing session is never retried automatically. Unattended checkpoint and relay remain unimplemented and unvalidated. Claude Code background jobs started outside Codex1CC are not managed by this task mechanism. See the [long-running task plan](docs/long-running-tasks-plan.md).
+After a write task delivers a reviewed phase, Codex can check the artifacts and known cumulative cost, then call `continue_task(..., fresh_session=true)` to start a new CC session in the same task worktree without loading the old conversation. The same relay is available after a failed write task only when Codex has explicitly inspected its retained diff, commits, scope, and test evidence; the continuation instruction must state what is verified and what remains. If CC still exceeds its context window, the task fails with `CONTEXT_LIMIT` and retains its write worktree. Automatic handoff asks Codex to inspect the evidence. The failed or overflowing session is never retried automatically. Automatic Codex review and fresh-session relay between CC rounds have passed a real two-round task; proactive checkpointing within a running CC round remains unimplemented and unvalidated. Claude Code background jobs started outside Codex1CC are not managed by this task mechanism. See the [long-running task plan](docs/long-running-tasks-plan.md).
 
 ### Optional native CC editing (experimental)
 
@@ -126,6 +126,55 @@ Authorize the project in the configuration above first; the skill does not grant
 Coding tasks require `write_backend` to be explicitly enabled and the task scope to fit within `write_paths`; the skill never enables project write access merely because a prompt asks for edits. A new task worktree starts at the configured project's committed `HEAD`, so check its base before assigning work that depends on another branch. Automatic handoff requires a connected binding; manual tasks do not. If Codex cannot find the skill, confirm `codex1cc install-skill` succeeded and restart or refresh Codex. If the MCP tools are missing, check `codex mcp list`. After a Codex1CC upgrade, run `codex1cc install-skill --force` to refresh the bundled skill.
 
 ## Optional automatic handoff (experimental)
+
+### Autonomous goals (0.6)
+
+Automatic native-write submissions now default to `autonomous=true`. The executor
+inherits a configured automatic project binding when `handoff` is omitted; pass
+`handoff="manual"` to explicitly choose manual handling. It
+stores the original objective, acceptance, and initial project write authorization
+as a persistent goal. A failed CC round leaves that goal active. Codex must inspect
+the retained artifacts, continue verified work, or record a concrete blocker with
+`manage_goal`; acknowledging an active goal merely as `failed` or `reviewed` is
+rejected. Pass `autonomous=false` for the previous single-event review behavior.
+If the user restricts paths for the entire objective, pass `authorized_scope` at
+submission to capture that narrower boundary separately from this round's `scope`.
+
+For repairs, call `continue_task` with `fresh_session=true`, an exact instruction,
+`review_note`, and the inspected commit as `expected_head`. An optional revised
+`scope` is checked against both the original and current project write authorization.
+The same worktree, partial commits, original objective, and acceptance survive the
+relay. Existing outside-scope changes prevent replanning. No baseline merge is
+needed. Completion requires `expected_head` and one `acceptance_evidence` entry per
+original criterion. Evidence remains Codex's responsibility to verify.
+
+Use `manage_goal(status="blocked", reason=...)` for actual technical impediments or
+exhausted limits, and `status="needs_user"` for a genuine user decision. Use
+`status="active"` to adopt an unfinished legacy automatic write task or resume a
+recorded goal. Legacy adoption keeps initial path authorization and applies current
+configured round/turn caps. An idle active goal receives a new recovery decision
+event; uncertain prior turns are retained for reconciliation and produce an explicit
+blocker. The executor never replays an uncertain event. Time, round, and handoff turn
+caps remain enforced; configure `limits.rounds` and `handoff.max_turns` up to 10 for
+longer workflows.
+
+Controller conclusions, continuation, completion, and blockers are saved in a
+durable inbox and delivered as local desktop notifications when supported. WSL
+uses the Windows toast service. Delivery errors remain visible in the inbox.
+`CODEX1CC_DESKTOP_NOTIFICATIONS=0` disables desktop delivery for a newly started
+executor. The original Codex window is not guaranteed to reopen.
+
+```sh
+codex1cc status PROJECT_ID
+codex1cc follow TASK_ID       # concise event stream across CC rounds; no model polling
+codex1cc notifications       # saved notifications and desktop delivery errors
+codex1cc upgrade [TASK_ID]   # drain workers, restart, refresh skill/MCP; optionally adopt retained work
+```
+
+`upgrade` waits for existing CC workers and accepted Codex turns to finish before
+switching executors. The database migration makes a private backup first. A model
+turn ending is not sufficient evidence that acceptance passed; controller reviews
+must check real files, commits, and tests.
 
 After installing `$codex1cc-ops`, ask Codex to execute lifecycle operations directly:
 

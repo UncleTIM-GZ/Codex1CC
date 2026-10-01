@@ -100,7 +100,7 @@ class _Connection:
         self.reader_task = asyncio.create_task(self._read())
         try:
             await self.request("initialize", {
-                "clientInfo": {"name": "codex1cc", "title": "Codex1CC", "version": "0.3.0"},
+                "clientInfo": {"name": "codex1cc", "title": "Codex1CC", "version": "0.6.0"},
                 "capabilities": {"experimentalApi": True},
             }, timeout=5)
             await self.send({"method": "initialized", "params": {}})
@@ -221,7 +221,7 @@ class _Connection:
         if not isinstance(tool_args, dict):
             return False
         message_text = params.get("message")
-        for tool in ("get_task", "respond_task", "continue_task", "complete_task", "ack_handoff"):
+        for tool in ("get_task", "respond_task", "continue_task", "complete_task", "manage_goal", "ack_handoff"):
             if message_text != f'Allow the codex1cc MCP server to run tool "{tool}"?':
                 continue
             if tool == "ack_handoff":
@@ -282,7 +282,7 @@ class AppServerHost:
                 if not isinstance(item, dict) or item.get("name") != "codex1cc":
                     continue
                 tools = item.get("tools") or {}
-                required = {"get_task", "respond_task", "continue_task", "complete_task", "ack_handoff"}
+                required = {"get_task", "respond_task", "continue_task", "complete_task", "manage_goal", "ack_handoff"}
                 if item.get("runtimeStatus") != "connected" or not isinstance(tools, dict):
                     raise HostError("Codex1CC MCP is unavailable in the bound Codex thread: " +
                                     str(item.get("toolsError") or item.get("runtimeStatus")))
@@ -298,16 +298,18 @@ class AppServerHost:
     async def create_thread(self, cwd: str) -> str:
         raise HostError("An empty Codex thread is not persistent; bind an existing saved session")
 
-    async def initialize_thread(self, cwd: str, *, timeout: float = 120) -> str:
+    async def initialize_thread(self, cwd: str, *, timeout: float = 120,
+                                config: dict[str, Any] | None = None) -> str:
         """Explicit, billable initialization of a resumable legacy thread."""
         path = Path(cwd).resolve()
         if not path.is_dir():
             raise HostError("Codex project directory does not exist")
         deadline = asyncio.get_running_loop().time() + timeout
         async with _Connection(await self._socket_path()) as connection:
-            result = await connection.request("thread/start", {
-                "cwd": str(path), "serviceName": "codex1cc", "historyMode": "legacy",
-            })
+            start_params: dict[str, Any] = {"cwd": str(path), "serviceName": "codex1cc", "historyMode": "legacy"}
+            if config is not None:
+                start_params["config"] = config
+            result = await connection.request("thread/start", start_params)
             thread = result.get("thread")
             ident = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(ident, str) or not ident:
@@ -475,9 +477,19 @@ class AppServerHost:
                     elif message.get("method") == "client/request_rejected":
                         return Delivery(turn_id, "unknown", error="Interactive request rejected during automatic handoff")
                     elif message.get("method") == "thread/status/changed":
-                        status = (message.get("params") or {}).get("status") or {}
-                        if status.get("type") in {"notLoaded", "systemError"}:
-                            return Delivery(turn_id, "unknown", error="Codex thread stopped before completion was observed")
+                        params = message.get("params") or {}
+                        status = params.get("status") or {}
+                        if params.get("threadId") == ident and status.get("type") in {"notLoaded", "systemError"}:
+                            # Lifecycle notifications can race with a resume or MCP refresh.
+                            # Persisted turn state decides whether the controller actually stopped.
+                            persisted = await connection.request("thread/read", {"threadId": ident, "includeTurns": True})
+                            for turn in (persisted.get("thread") or {}).get("turns", []):
+                                if turn.get("id") == turn_id:
+                                    if turn.get("status") != "inProgress":
+                                        return _turn_result(turn)
+                                    break
+                            else:
+                                return Delivery(turn_id, "unknown", error="Codex turn missing after thread status change")
             except asyncio.TimeoutError:
                 return Delivery(turn_id, "unknown", error="Timed out waiting for Codex completion")
         finally:

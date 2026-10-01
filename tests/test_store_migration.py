@@ -40,8 +40,8 @@ class StoreMigrationTest(unittest.TestCase):
             store = Store(path)
             try:
                 self.assertEqual(store.one("oldtask")["status"], "review_required")
-                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(store.db.execute("PRAGMA user_version").fetchone()[0], 4)
                 self.assertIn("request_id", {row[1] for row in store.db.execute("PRAGMA table_info(rounds)")})
-                self.assertEqual(len(list(Path(directory).glob("state.sqlite3.pre-v3-*.bak"))), 1)
+                self.assertEqual(len(list(Path(directory).glob("state.sqlite3.pre-v4-*.bak"))), 1)
             finally:
                 store.db.close()

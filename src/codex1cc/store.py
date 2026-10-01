@@ -59,8 +59,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        if existing_database and self.db.execute("PRAGMA user_version").fetchone()[0] < 3:
-            backup_path = path.with_name(path.name + f".pre-v3-{uuid.uuid4().hex[:8]}.bak")
+        if existing_database and self.db.execute("PRAGMA user_version").fetchone()[0] < 4:
+            backup_path = path.with_name(path.name + f".pre-v4-{uuid.uuid4().hex[:8]}.bak")
             fd = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
             try:
@@ -115,6 +115,18 @@ class Store:
             UNIQUE(task_id,event_key), FOREIGN KEY(task_id) REFERENCES tasks(id)
           );
           CREATE INDEX IF NOT EXISTS handoff_ready ON handoff_events(status,next_attempt_at);
+          CREATE TABLE IF NOT EXISTS goals (
+            task_id TEXT PRIMARY KEY REFERENCES tasks(id), status TEXT NOT NULL,
+            objective TEXT NOT NULL, acceptance_json TEXT NOT NULL,
+            authorized_paths_json TEXT NOT NULL, reason TEXT,
+            recovery_no INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL, updated_at REAL NOT NULL
+          );
+          CREATE TABLE IF NOT EXISTS notifications (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL REFERENCES tasks(id),
+            title TEXT NOT NULL, message TEXT NOT NULL, created_at REAL NOT NULL,
+            delivered_at REAL, error TEXT, attempted INTEGER NOT NULL DEFAULT 0
+          );
         """)
         existing = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
         for name in ("bundle_json", "project_json", "result_json", "process_id",
@@ -128,7 +140,7 @@ class Store:
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS round_request_one ON rounds(request_id) WHERE request_id IS NOT NULL")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS complete_request_one ON tasks(complete_request_id) WHERE complete_request_id IS NOT NULL")
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS cancel_request_one ON tasks(cancel_request_id) WHERE cancel_request_id IS NOT NULL")
-        self.db.execute("PRAGMA user_version=3")
+        self.db.execute("PRAGMA user_version=4")
         self.db.commit()
 
     def one(self, task_id: str) -> dict:
@@ -139,7 +151,55 @@ class Store:
         item["usage"] = json.loads(item.pop("usage_json") or "null")
         for column, key in (("bundle_json", "bundle"), ("project_json", "project"), ("result_json", "result")):
             item[key] = json.loads(item.pop(column) or "null")
+        item["goal"] = self.goal(task_id)
         return item
+
+    def goal(self, task_id: str) -> dict | None:
+        row = self.db.execute("SELECT * FROM goals WHERE task_id=?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["acceptance"] = json.loads(result.pop("acceptance_json"))
+        result["authorized_paths"] = json.loads(result.pop("authorized_paths_json"))
+        return result
+
+    def create_goal(self, task_id: str, bundle: dict, project: dict) -> None:
+        now = time.time()
+        self.db.execute("""INSERT INTO goals
+            (task_id,status,objective,acceptance_json,authorized_paths_json,created_at,updated_at)
+            VALUES(?,'active',?,?,?,?,?)""", (task_id, bundle["objective"],
+            json.dumps(bundle["acceptance"], ensure_ascii=False),
+            json.dumps(bundle.get("authorized_scope") or project["write_backend"]["write_paths"]), now, now))
+
+    def set_goal(self, task_id: str, status: str, reason: str | None = None) -> None:
+        with self.db:
+            self.db.execute("UPDATE goals SET status=?,reason=?,updated_at=? WHERE task_id=?",
+                            (status, scrub(reason), time.time(), task_id))
+        self.event(task_id, "goal_status", {"status": status, "reason": reason})
+        self.notify(task_id, "Codex1CC · " + status, reason or "Goal " + status)
+
+    def notify(self, task_id: str, title: str, message: str) -> None:
+        task = self.db.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task:
+            message = f"[{task['project_id']} · {task_id[:8]}] " + message
+        with self.db:
+            self.db.execute("INSERT INTO notifications(task_id,title,message,created_at) VALUES(?,?,?,?)",
+                            (task_id, scrub(title[:100]), scrub(message[:2000]), time.time()))
+        if self.on_event:
+            self.on_event()
+
+    def recover_goal(self, task_id: str) -> None:
+        """Create a new decision event, never replay a previous Codex turn."""
+        item = self.one(task_id)
+        with self.db:
+            self.db.execute("UPDATE goals SET recovery_no=recovery_no+1,updated_at=? WHERE task_id=?",
+                            (time.time(), task_id))
+            questions = self.pending_questions(task_id)
+            self._enqueue_handoff(task_id, "goal_recovery", {
+                "recovery_no": self.goal(task_id)["recovery_no"],
+                "question_id": questions[0]["id"] if questions else "",
+                "reason": "Goal incomplete with no active worker or controller"})
+        self.event(task_id, "goal_recovery", {"status": item["status"]})
 
     def create(self, task_id: str, project_id: str, request_id: str, bundle: dict,
                project: dict, snapshot_path: str) -> None:
@@ -155,6 +215,8 @@ class Store:
                  json.dumps(project, ensure_ascii=False)))
             self.db.execute("INSERT INTO rounds(task_id,round_no,instruction,status) VALUES(?,?,?,?)",
                             (task_id, 1, bundle["objective"], "queued"))
+            if bundle.get("autonomous"):
+                self.create_goal(task_id, bundle, project)
 
     def list_tasks(self, project_id: str | None, statuses: list[str] | None,
                    offset: int, limit: int) -> list[dict]:
@@ -175,6 +237,7 @@ class Store:
         for row in self.db.execute(sql, values):
             item = dict(row)
             item["result"] = json.loads(item.pop("result_json") or "null")
+            item["goal"] = self.goal(item["id"])
             result.append(item)
         return result
 
@@ -219,16 +282,24 @@ class Store:
             keys = list(fields)
             self.db.execute(f"UPDATE tasks SET {', '.join(k + '=?' for k in keys)} WHERE id=?",
                             [fields[k] for k in keys] + [task_id])
+            goal_status = {"completed": "completed", "canceled": "canceled",
+                           "continuing": "active"}.get(fields.get("status"))
+            if goal_status:
+                self.db.execute("UPDATE goals SET status=?,reason=NULL,updated_at=? WHERE task_id=?",
+                                (goal_status, time.time(), task_id))
             cur = self.db.execute("INSERT INTO events(task_id,kind,data_json,created_at) VALUES(?,?,?,?)",
                                   (task_id, kind, payload, time.time()))
             self._enqueue_handoff(task_id, kind, data)
             seq = cur.lastrowid
         if self.on_event:
             self.on_event()
+        if goal_status and self.goal(task_id):
+            self.notify(task_id, "Codex1CC · " + goal_status,
+                        data.get("review_note") or data.get("instruction") or "Goal " + goal_status)
         return seq
 
     def _enqueue_handoff(self, task_id: str, kind: str, data: dict) -> None:
-        if kind not in {"question", "review_required", "failed", "interrupted", "question_expired"}:
+        if kind not in {"question", "review_required", "failed", "interrupted", "question_expired", "goal_recovery"}:
             return
         row = self.db.execute("SELECT round_no,bundle_json FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not row or not row["bundle_json"]:
@@ -238,6 +309,8 @@ class Store:
             return
         now = time.time()
         event_key = f"{row['round_no']}:{kind}:{data.get('question_id', '')}"
+        if kind == "goal_recovery":
+            event_key += f":{data.get('recovery_no', self.goal(task_id)['recovery_no'])}"
         self.db.execute("""INSERT OR IGNORE INTO handoff_events
             (id,task_id,round_no,event_key,kind,status,binding_json,receipt_token,summary_json,created_at,updated_at,next_attempt_at)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -333,10 +406,13 @@ class Store:
                 (status, attempts, time.time() + delay, time.time(), str(scrub(reason))[:500], event_id))
 
     def handoff_defer(self, event_id: str, reason: str, delay: float = 60) -> None:
+        previous = self.handoff_one(event_id)
         with self.db:
             self.db.execute("""UPDATE handoff_events SET status='pending',next_attempt_at=?,updated_at=?,error=?
                 WHERE id=? AND status IN ('pending','sending')""",
                 (time.time() + delay, time.time(), str(scrub(reason))[:500], event_id))
+        if previous.get("error") != str(scrub(reason))[:500] and reason != "Codex session is busy":
+            self.notify(previous["task_id"], "Codex1CC · connection delayed", reason)
 
     def handoff_awaken(self, event_id: str) -> None:
         with self.db:
@@ -366,11 +442,15 @@ class Store:
             self.event(task_id, "handoff_attention", {"event_id": event_id, "reason": reason})
 
     def handoff_record_turn(self, event_id: str, status: str, result: str | None) -> None:
+        previous = self.handoff_one(event_id)
         with self.db:
             self.db.execute("""UPDATE handoff_events SET codex_status=?,codex_result=?,updated_at=?
                 WHERE id=? AND turn_id IS NOT NULL""",
                 (status[:40], scrub(result[:2000]) if isinstance(result, str) else None,
                  time.time(), event_id))
+        if previous["codex_status"] != status and status in {"completed", "failed", "interrupted", "unknown"}:
+            self.notify(previous["task_id"], "Codex1CC · Codex " + status,
+                        result or "Codex review ended: " + status)
 
     def handoff_supersede(self, event_id: str) -> None:
         with self.db:
