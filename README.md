@@ -8,7 +8,7 @@ Install Codex1CC where it can access your project files and Claude Code. Codex c
 
 The [2026-10-01 reliability audit](docs/reliability-audit-2026-10-01.md) documents lifecycle repairs, failure-injection coverage, and remaining release gates. Autonomous repair currently covers one bounded goal; general cross-task integration and production release orchestration remain outside that capability.
 
-**中文完整说明：**[安装、项目初始化、指挥 CC、跨会话验收与注意事项](README.zh-CN.md)。
+**中文完整说明：**[从开始、绑定、委托、验收到解除并由 Codex 接回的完整流程](README.zh-CN.md#从开始到解除一套完整流程)，以及[安装、项目初始化与注意事项](README.zh-CN.md)。
 
 Licensed under MIT; see [LICENSE](LICENSE).
 
